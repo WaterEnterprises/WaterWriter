@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/WaterEnterprises/WaterWriter/internal/agent"
 	"github.com/WaterEnterprises/WaterWriter/internal/db"
 	"github.com/WaterEnterprises/WaterWriter/internal/llm"
+	"github.com/WaterEnterprises/WaterWriter/internal/dict"
 	"github.com/ZeroHawkeye/wordZero/pkg/document"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -1410,32 +1412,34 @@ func (m *Model) writeExportFile(outDir, title, subtitle string, chapters []*db.C
 		if err != nil {
 			return exportDoneMsg{err: fmt.Errorf("get subchapters for %q: %w", ch.Title, err)}
 		}
-	for _, s := range subs {
-		if s.Content != "" {
-			// Strip any leading #-style markdown headings from LLM content.
-			// The LLM often writes headings like "#### Subchapter Title" at
-			// the start of its output, creating a "duplicate subchapter" look.
-			// The exporter already adds the correct ### heading, so we strip
-			// any that the LLM included. Only LEADING headings are removed.
-			content := strings.TrimLeft(s.Content, "\n\r\t ")
-			for strings.HasPrefix(content, "#") {
-				idx := strings.IndexByte(content, '\n')
-				if idx < 0 {
-					content = ""
-					break
+		for _, s := range subs {
+			if s.Content != "" {
+				// Strip any leading #-style markdown headings from LLM content.
+				// The LLM often writes headings like "#### Subchapter Title" at
+				// the start of its output, creating a "duplicate subchapter" look.
+				// The exporter already adds the correct ### heading, so we strip
+				// any that the LLM included. Only LEADING headings are removed.
+				content := strings.TrimLeft(s.Content, "\n\r\t ")
+				for strings.HasPrefix(content, "#") {
+					idx := strings.IndexByte(content, '\n')
+					if idx < 0 {
+						content = ""
+						break
+					}
+					content = strings.TrimLeft(content[idx+1:], "\n\r\t ")
 				}
-				content = strings.TrimLeft(content[idx+1:], "\n\r\t ")
+				if content == "" {
+					continue
+				}
+				// Fix LLM spacing issues (merged words) at export time safe-net.
+				content = normalizeSpacing(content)
+				if m.exportIncludeSubs {
+					fullBook.WriteString(fmt.Sprintf("### %s\n\n", s.Title))
+				}
+				fullBook.WriteString(content)
+				fullBook.WriteString("\n\n")
 			}
-			if content == "" {
-				continue
-			}
-			if m.exportIncludeSubs {
-				fullBook.WriteString(fmt.Sprintf("### %s\n\n", s.Title))
-			}
-			fullBook.WriteString(content)
-			fullBook.WriteString("\n\n")
 		}
-	}
 	}
 
 	// Always write the markdown file.
@@ -1496,6 +1500,8 @@ func (m *Model) writeDocxFile(outDir, title, subtitle string, chapters []*db.Cha
 				if content == "" {
 					continue
 				}
+				// Fix LLM spacing issues (merged words) at export time.
+				content = normalizeSpacing(content)
 				doc.AddHeadingParagraph(s.Title, 3)
 				for _, p := range strings.Split(content, "\n\n") {
 					p = strings.TrimSpace(p)
@@ -1578,11 +1584,37 @@ func normalizeSpacing(s string) string {
 	s = regexp.MustCompile(`,([a-zA-Z])`).ReplaceAllString(s, ", $1")
 	// Fix missing space after ? or !.
 	s = regexp.MustCompile(`([?!])([a-zA-Z])`).ReplaceAllString(s, "$1 $2")
-	// Fix standalone "a" merged with the next word (very common LLM issue).
-	// This catches patterns like "amother" or "experiencinga" by looking for
-	// the letter 'a' surrounded by word characters where it's clearly the
-	// article "a" merged with adjacent text.
-	s = regexp.MustCompile(`([a-zA-Z&&[^aA]])a([a-zA-Z])`).ReplaceAllString(s, "$1 a $2")
+
+	// Fix "wordof" at end of word before space/punct (e.g., "blanketof " →
+	// "blanket of "). Matches "of" only when followed by whitespace,
+	// punctuation, or end-of-string. This avoids false positives like
+	// "coffee" → "c of fee" (where 'e' follows "of", not a space).
+	s = regexp.MustCompile(`([a-z])of([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 of$2")
+
+	// Fix "wordwas" at end of word before space/punct (e.g., "mirrorwas " →
+	// "mirror was "). No English word has "was" as an interior substring.
+	s = regexp.MustCompile(`([a-zA-Z])was([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 was$2")
+	// Fix " wasword" at start of word (e.g., " wasfinalized" → " was finalized").
+	s = regexp.MustCompile(`([\s.,;!?\-])was([a-zA-Z])`).ReplaceAllString(s, "$1 was $2")
+
+	// Fix "wordthat" at end of word before space/punct (e.g.,
+	// "somethingthat " → "something that "). Low false-positive risk.
+	s = regexp.MustCompile(`([a-z])that([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 that$2")
+	// Fix " thatword" at start of word (e.g., " thatpulsed" → " that pulsed").
+	s = regexp.MustCompile(`([\s.,;!?\-])that([a-zA-Z])`).ReplaceAllString(s, "$1 that $2")
+
+	// Fix article "a" at start of word (e.g., "amother" → " a mother").
+	// Matches start-of-string or whitespace/punct, then 'a', then a letter.
+	s = regexp.MustCompile(`(^|[\s.,;!?\-])a([a-zA-Z])`).ReplaceAllString(s, "$1 a $2")
+	// Fix article "a" at end of word before space/punct (e.g.,
+	// "experiencinga " → "experiencing a ").
+	s = regexp.MustCompile(`([a-zA-Z])a([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 a$2")
+
+	// Dictionary-based word segmentation for remaining merged words.
+	// This catches patterns that regex alone can't safely handle, like
+	// "enteredthrough" → "entered through", "hadbeen" → "had been", etc.
+	s = dict.SplitUnknown(s)
+
 	return s
 }
 

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
+	"github.com/WaterEnterprises/WaterWriter/internal/dict"
 	"github.com/ZeroHawkeye/wordZero/pkg/document"
 	"github.com/spf13/cobra"
 )
@@ -106,6 +108,8 @@ var exportCmd = &cobra.Command{
 					if content == "" {
 						continue
 					}
+					// Fix LLM spacing issues (merged words) at export time.
+					content = normalizeSpacing(content)
 					fullBook.WriteString(fmt.Sprintf("### %s\n\n", s.Title))
 					fullBook.WriteString(content)
 					fullBook.WriteString("\n\n")
@@ -155,6 +159,7 @@ var exportCmd = &cobra.Command{
 						if content == "" {
 							continue
 						}
+						content = normalizeSpacing(content)
 						doc.AddHeadingParagraph(s.Title, 3)
 						for _, p := range strings.Split(content, "\n\n") {
 							p = strings.TrimSpace(p)
@@ -175,6 +180,48 @@ var exportCmd = &cobra.Command{
 			fmt.Printf("Book exported to %s\n", docxPath)
 		}
 	},
+}
+
+// normalizeSpacing post-processes LLM content to fix common spacing issues.
+// LLMs occasionally merge adjacent words or omit spaces after punctuation
+// due to tokenization quirks. This function corrects those patterns.
+func normalizeSpacing(s string) string {
+	// Fix missing space after period followed by capital letter (new sentence).
+	s = regexp.MustCompile(`\.([A-Z])`).ReplaceAllString(s, ". $1")
+	// Fix missing space after comma.
+	s = regexp.MustCompile(`,([a-zA-Z])`).ReplaceAllString(s, ", $1")
+	// Fix missing space after ? or !.
+	s = regexp.MustCompile(`([?!])([a-zA-Z])`).ReplaceAllString(s, "$1 $2")
+
+	// Fix "wordof" at end of word before space/punct (e.g., "blanketof " →
+	// "blanket of "). Matches "of" only when followed by whitespace,
+	// punctuation, or end-of-string. This avoids false positives like
+	// "coffee" → "c of fee" (where 'e' follows "of", not a space).
+	s = regexp.MustCompile(`([a-z])of([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 of$2")
+
+	// Fix "wordwas" at end of word before space/punct (e.g., "mirrorwas " →
+	// "mirror was "). No English word has "was" as an interior substring.
+	s = regexp.MustCompile(`([a-zA-Z])was([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 was$2")
+	// Fix " wasword" at start of word (e.g., " wasfinalized" → " was finalized").
+	s = regexp.MustCompile(`([\s.,;!?\-])was([a-zA-Z])`).ReplaceAllString(s, "$1 was $2")
+
+	// Fix "wordthat" at end of word before space/punct (e.g.,
+	// "somethingthat " → "something that "). Low false-positive risk.
+	s = regexp.MustCompile(`([a-z])that([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 that$2")
+	// Fix " thatword" at start of word (e.g., " thatpulsed" → " that pulsed").
+	s = regexp.MustCompile(`([\s.,;!?\-])that([a-zA-Z])`).ReplaceAllString(s, "$1 that $2")
+
+	// Fix article "a" at start of word (e.g., "amother" → " a mother").
+	// Matches start-of-string or whitespace/punct, then 'a', then a letter.
+	s = regexp.MustCompile(`(^|[\s.,;!?\-])a([a-zA-Z])`).ReplaceAllString(s, "$1 a $2")
+	// Fix article "a" at end of word before space/punct (e.g.,
+	// "experiencinga " → "experiencing a ").
+	s = regexp.MustCompile(`([a-zA-Z])a([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 a$2")
+
+	// Dictionary-based word segmentation for remaining merged words.
+	s = dict.SplitUnknown(s)
+
+	return s
 }
 
 func sanitize(s string) string {
