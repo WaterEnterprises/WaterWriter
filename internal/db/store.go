@@ -47,10 +47,12 @@ func (d *DB) SetSettings(values map[string]string) error {
 
 // LLM setting keys.
 const (
-	SettingProvider = "provider"
-	SettingModel    = "model"
-	SettingBaseURL  = "base_url"
-	SettingStyle    = "style"
+	SettingProvider       = "provider"
+	SettingModel          = "model"
+	SettingBaseURL        = "base_url"
+	SettingStyle          = "style"
+	SettingThinkingEffort = "thinking_effort"
+	SettingAPIKey         = "api_key"
 )
 
 func (d *DB) CreateProject(name string) (*Project, error) {
@@ -174,6 +176,12 @@ func (d *DB) GetQAPairs(projectID int) ([]QAPair, error) {
 
 func (d *DB) DeleteQAPairs(projectID int) error {
 	_, err := d.Exec(`DELETE FROM qa_pairs WHERE project_id = ?`, projectID)
+	return err
+}
+
+func (d *DB) UpdateQAPair(projectID int, position int, answer string) error {
+	_, err := d.Exec(`UPDATE qa_pairs SET answer = ?, created_at = ? WHERE project_id = ? AND position = ?`,
+		answer, now(), projectID, position)
 	return err
 }
 

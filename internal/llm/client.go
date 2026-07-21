@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"sort"
@@ -242,14 +243,15 @@ func ListProviders() []string {
 }
 
 type Client struct {
-	Provider     string
-	BaseURL      string
-	APIKey       string
-	Model        string
-	Style        Style
-	RequiresKey  bool
-	ExtraHeaders map[string]string
-	HTTP         *http.Client
+	Provider       string
+	BaseURL        string
+	APIKey         string
+	Model          string
+	Style          Style
+	RequiresKey    bool
+	ExtraHeaders   map[string]string
+	ThinkingEffort string // "low" | "medium" | "high" (empty = default)
+	HTTP           *http.Client
 }
 
 // Config is the resolved LLM configuration. Any field left empty falls back to
@@ -257,12 +259,13 @@ type Client struct {
 // NewClient is used). The API key is never stored in the database; it always
 // comes from the environment.
 type Config struct {
-	Provider     string
-	BaseURL      string
-	APIKey       string
-	Model        string
-	Style        string // "openai" | "anthropic" | "gemini"
-	ExtraHeaders string
+	Provider       string
+	BaseURL        string
+	APIKey         string
+	Model          string
+	Style          string // "openai" | "anthropic" | "gemini"
+	ExtraHeaders   string
+	ThinkingEffort string // "low" | "medium" | "high" (empty = default)
 }
 
 // NewClient builds a client from environment variables.
@@ -326,15 +329,21 @@ func NewClientFromConfig(cfg Config) *Client {
 		requiresKey = apiKey != ""
 	}
 
+	te := strings.ToLower(strings.TrimSpace(cfg.ThinkingEffort))
+	if te != "low" && te != "medium" && te != "high" {
+		te = ""
+	}
+
 	return &Client{
-		Provider:     provider,
-		BaseURL:      strings.TrimRight(baseURL, "/"),
-		APIKey:       apiKey,
-		Model:        model,
-		Style:        style,
-		RequiresKey:  requiresKey,
-		ExtraHeaders: extraHeaders,
-		HTTP:         &http.Client{Timeout: 10 * time.Minute},
+		Provider:       provider,
+		BaseURL:        strings.TrimRight(baseURL, "/"),
+		APIKey:         apiKey,
+		Model:          model,
+		Style:          style,
+		RequiresKey:    requiresKey,
+		ExtraHeaders:   extraHeaders,
+		ThinkingEffort: te,
+		HTTP:           &http.Client{Timeout: 10 * time.Minute},
 	}
 }
 
@@ -362,6 +371,86 @@ func parseHeaders(s string) map[string]string {
 		}
 	}
 	return out
+}
+
+// retryableStatus returns true for HTTP status codes that warrant a retry.
+func retryableStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests,       // 429
+		http.StatusBadGateway,              // 502
+		http.StatusServiceUnavailable,       // 503
+		http.StatusGatewayTimeout:           // 504
+		return true
+	}
+	return false
+}
+
+// retryDo wraps an HTTP request with exponential backoff + jitter.
+// It retries up to maxRetries times on network errors and retryable status codes
+// (429, 502, 503, 504). Non-retryable errors are returned immediately.
+// bodyBytes must be provided for requests with a body so it can be re-created
+// on each retry (the original body is consumed after the first attempt).
+func (c *Client) retryDo(req *http.Request, bodyBytes []byte, maxRetries int) (*http.Response, error) {
+	baseDelay := 1 * time.Second
+	maxDelay := 30 * time.Second
+
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Refresh the request body from the original bytes on each retry.
+		if bodyBytes != nil {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = err
+			// Network error — retryable
+			if attempt < maxRetries {
+				// exponential backoff + jitter before next attempt
+				c.backoffSleep(req.Context(), attempt, baseDelay, maxDelay)
+				continue
+			}
+			return resp, err
+		}
+		if !retryableStatus(resp.StatusCode) {
+			// Success or non-retryable client error
+			return resp, nil
+		}
+		// Retryable status — consume body so the connection can be reused
+		if resp.Body != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		if attempt >= maxRetries {
+			return resp, fmt.Errorf("llm request failed after %d retries (last status %d)", maxRetries, resp.StatusCode)
+		}
+		// Backoff before next attempt
+		c.backoffSleep(req.Context(), attempt, baseDelay, maxDelay)
+	}
+
+	// Unreachable, but the Go compiler doesn't know that.
+	return nil, lastErr
+}
+
+// backoffSleep sleeps with exponential backoff + jitter, respecting context cancellation.
+func (c *Client) backoffSleep(ctx context.Context, attempt int, baseDelay, maxDelay time.Duration) bool {
+	delay := baseDelay * (1 << uint(attempt)) // 2^attempt: 1s, 2s, 4s, 8s, ...
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	// Apply jitter: ±50%
+	jitter := time.Duration(float64(delay) * (0.5 + 0.5*rand.Float64()))
+	if jitter > maxDelay {
+		jitter = maxDelay
+	}
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(jitter):
+		return true
+	}
 }
 
 // Ready reports whether the client can make a request (i.e. required key set).
@@ -411,11 +500,12 @@ func (c *Client) CompleteStream(ctx context.Context, messages []Message, tempera
 // ---------- OpenAI-compatible (OpenAI, Gemini, DeepSeek, Groq, Ollama, ...) ----------
 
 type chatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Model           string    `json:"model"`
+	Messages        []Message `json:"messages"`
+	Temperature     float64   `json:"temperature,omitempty"`
+	Stream          bool      `json:"stream,omitempty"`
+	MaxTokens       int       `json:"max_tokens,omitempty"`
+	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
 }
 
 type chatResponse struct {
@@ -431,10 +521,11 @@ type chatResponse struct {
 
 func (c *Client) openAIComplete(ctx context.Context, messages []Message, temperature float64, _ bool) (string, error) {
 	reqBody, _ := json.Marshal(chatRequest{
-		Model:       c.Model,
-		Messages:    messages,
-		Temperature: temperature,
-		Stream:      false,
+		Model:           c.Model,
+		Messages:        messages,
+		Temperature:     temperature,
+		Stream:          false,
+		ReasoningEffort: c.ThinkingEffort,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(reqBody))
 	if err != nil {
@@ -443,7 +534,7 @@ func (c *Client) openAIComplete(ctx context.Context, messages []Message, tempera
 	req.Header.Set("Content-Type", "application/json")
 	c.setOpenAIHeaders(req)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.retryDo(req, reqBody, 4)
 	if err != nil {
 		return "", err
 	}
@@ -470,10 +561,11 @@ func (c *Client) openAIComplete(ctx context.Context, messages []Message, tempera
 
 func (c *Client) openAIStream(ctx context.Context, messages []Message, temperature float64, onChunk func(string) error) (string, error) {
 	reqBody, _ := json.Marshal(chatRequest{
-		Model:       c.Model,
-		Messages:    messages,
-		Temperature: temperature,
-		Stream:      true,
+		Model:           c.Model,
+		Messages:        messages,
+		Temperature:     temperature,
+		Stream:          true,
+		ReasoningEffort: c.ThinkingEffort,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(reqBody))
 	if err != nil {
@@ -482,7 +574,7 @@ func (c *Client) openAIStream(ctx context.Context, messages []Message, temperatu
 	req.Header.Set("Content-Type", "application/json")
 	c.setOpenAIHeaders(req)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.retryDo(req, reqBody, 4)
 	if err != nil {
 		return "", err
 	}
@@ -602,7 +694,7 @@ func (c *Client) anthropicComplete(ctx context.Context, messages []Message, temp
 	c.applyExtraHeaders(req)
 
 	if !stream {
-		resp, err := c.HTTP.Do(req)
+		resp, err := c.retryDo(req, reqBody, 4)
 		if err != nil {
 			return "", err
 		}
@@ -630,7 +722,7 @@ func (c *Client) anthropicComplete(ctx context.Context, messages []Message, temp
 		return strings.TrimSpace(sb.String()), nil
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.retryDo(req, reqBody, 4)
 	if err != nil {
 		return "", err
 	}
@@ -808,7 +900,7 @@ func (c *Client) geminiComplete(ctx context.Context, messages []Message, tempera
 	c.applyExtraHeaders(req)
 
 	if !stream {
-		resp, err := c.HTTP.Do(req)
+		resp, err := c.retryDo(req, reqBody, 4)
 		if err != nil {
 			return "", err
 		}
@@ -827,7 +919,7 @@ func (c *Client) geminiComplete(ctx context.Context, messages []Message, tempera
 		return geminiText(out)
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.retryDo(req, reqBody, 4)
 	if err != nil {
 		return "", err
 	}
@@ -918,7 +1010,7 @@ func (c *Client) listOpenAIModels(ctx context.Context) ([]string, error) {
 	if c.Provider != "ollama" {
 		c.setOpenAIHeaders(req)
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.retryDo(req, nil, 4)
 	if err != nil {
 		return nil, err
 	}
@@ -966,7 +1058,7 @@ func (c *Client) listAnthropicModels(ctx context.Context) ([]string, error) {
 	}
 	c.applyExtraHeaders(req)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.retryDo(req, nil, 4)
 	if err != nil {
 		return nil, err
 	}
@@ -1000,7 +1092,7 @@ func (c *Client) listGeminiModels(ctx context.Context) ([]string, error) {
 	}
 	c.applyExtraHeaders(req)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.retryDo(req, nil, 4)
 	if err != nil {
 		return nil, err
 	}

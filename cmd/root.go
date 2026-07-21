@@ -115,21 +115,23 @@ func initApp() (*db.DB, *llm.Client, *agent.Agent, error) {
 	}
 
 	// Merge saved database settings with environment variables. The database
-	// holds the user's selected provider/model; env still supplies the key and
-	// can override any saved value.
+	// holds the user's selected provider/model/API key; env can override any
+	// saved value (useful for CI or power users).
 	saved, err := database.GetSettings(
 		db.SettingProvider, db.SettingModel, db.SettingBaseURL, db.SettingStyle,
+		db.SettingAPIKey, db.SettingThinkingEffort,
 	)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("load settings: %w", err)
 	}
 	cfg := llm.Config{
-		Provider:     firstNonEmpty(saved[db.SettingProvider], os.Getenv("WATERWRITER_LLM_PROVIDER")),
-		BaseURL:      firstNonEmpty(saved[db.SettingBaseURL], os.Getenv("WATERWRITER_LLM_BASE_URL")),
-		Model:        firstNonEmpty(saved[db.SettingModel], os.Getenv("WATERWRITER_LLM_MODEL")),
-		Style:        firstNonEmpty(saved[db.SettingStyle], os.Getenv("WATERWRITER_LLM_API_STYLE")),
-		APIKey:       os.Getenv("WATERWRITER_LLM_API_KEY"),
-		ExtraHeaders: os.Getenv("WATERWRITER_LLM_EXTRA_HEADERS"),
+		Provider:       firstNonEmpty(saved[db.SettingProvider], os.Getenv("WATERWRITER_LLM_PROVIDER")),
+		BaseURL:        firstNonEmpty(saved[db.SettingBaseURL], os.Getenv("WATERWRITER_LLM_BASE_URL")),
+		Model:          firstNonEmpty(saved[db.SettingModel], os.Getenv("WATERWRITER_LLM_MODEL")),
+		Style:          firstNonEmpty(saved[db.SettingStyle], os.Getenv("WATERWRITER_LLM_API_STYLE")),
+		APIKey:         firstNonEmpty(saved[db.SettingAPIKey], os.Getenv("WATERWRITER_LLM_API_KEY")),
+		ThinkingEffort: saved[db.SettingThinkingEffort],
+		ExtraHeaders:   os.Getenv("WATERWRITER_LLM_EXTRA_HEADERS"),
 	}
 	llmClient := llm.NewClientFromConfig(cfg)
 	ag := agent.New(llmClient, database)
