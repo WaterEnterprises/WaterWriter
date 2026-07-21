@@ -1595,17 +1595,14 @@ func normalizeSpacing(s string) string {
 	// "mirror was "). No English word has "was" as an interior substring.
 	s = regexp.MustCompile(`([a-zA-Z])was([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 was$2")
 	// Fix " wasword" at start of word (e.g., " wasfinalized" → " was finalized").
-	s = regexp.MustCompile(`([\s.,;!?\-])was([a-zA-Z])`).ReplaceAllString(s, "$1 was $2")
+	s = regexp.MustCompile(`([\s.,;!?\-])was([a-zA-Z])`).ReplaceAllString(s, "${1}was $2")
 
 	// Fix "wordthat" at end of word before space/punct (e.g.,
 	// "somethingthat " → "something that "). Low false-positive risk.
 	s = regexp.MustCompile(`([a-z])that([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 that$2")
 	// Fix " thatword" at start of word (e.g., " thatpulsed" → " that pulsed").
-	s = regexp.MustCompile(`([\s.,;!?\-])that([a-zA-Z])`).ReplaceAllString(s, "$1 that $2")
+	s = regexp.MustCompile(`([\s.,;!?\-])that([a-zA-Z])`).ReplaceAllString(s, "${1}that $2")
 
-	// Fix article "a" at start of word (e.g., "amother" → " a mother").
-	// Matches start-of-string or whitespace/punct, then 'a', then a letter.
-	s = regexp.MustCompile(`(^|[\s.,;!?\-])a([a-zA-Z])`).ReplaceAllString(s, "$1 a $2")
 	// Fix article "a" at end of word before space/punct (e.g.,
 	// "experiencinga " → "experiencing a ").
 	s = regexp.MustCompile(`([a-zA-Z])a([\s.,;!?\-]|$)`).ReplaceAllString(s, "$1 a$2")

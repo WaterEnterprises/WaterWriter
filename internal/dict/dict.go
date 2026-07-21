@@ -196,6 +196,26 @@ func SplitUnknown(s string) string {
 			continue
 		}
 
+		// Special case: single-character article "a" merged with a word.
+		// The main loop below starts at split=2 (minimum 2 chars per part),
+		// so it never tries the split "a" + rest at position 1. Check it
+		// here before falling through to the general split loop.
+		// Only applies when the full word is NOT in the dictionary (already
+		// ensured by the wordSet check above), so dictionary words like
+		// "alone", "and", "air" are never split.
+		if len(word) > 2 && (word[0] == 'a' || word[0] == 'A') {
+			rest := word[1:]
+			if wordSet[strings.ToLower(rest)] || wordOrStem(rest) {
+				var buf strings.Builder
+				buf.Write(result[:start+1])
+				buf.WriteByte(' ')
+				buf.Write(result[start+1:])
+				result = []byte(buf.String())
+				i = start + 2 // skip past "a "
+				continue
+			}
+		}
+
 		// Try all split points.
 		bestSplit := 0
 		for split := 2; split < len(word); split++ {
