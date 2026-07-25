@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/WaterEnterprises/WaterWriter/internal/log"
 )
 
 type Message struct {
@@ -127,8 +129,8 @@ var Providers = map[string]ProviderPreset{
 	},
 	"huggingface": {
 		Name:         "Hugging Face Inference",
-		BaseURL:      "https://api-inference.huggingface.co/v1",
-		DefaultModel: "meta-llama/Llama-3.3-70B-Instruct",
+		BaseURL:      "https://router.huggingface.co/v1",
+		DefaultModel: "meta-llama/Llama-3.3-70B-Instruct:fastest",
 		Style:        StyleOpenAI,
 		RequiresKey:  true,
 	},
@@ -252,6 +254,7 @@ type Client struct {
 	ExtraHeaders   map[string]string
 	ThinkingEffort string // "low" | "medium" | "high" (empty = default)
 	HTTP           *http.Client
+	Log            *log.Logger // optional logger for API call logging
 }
 
 // Config is the resolved LLM configuration. Any field left empty falls back to
@@ -407,14 +410,18 @@ func (c *Client) retryDo(req *http.Request, bodyBytes []byte, maxRetries int) (*
 			lastErr = err
 			// Network error — retryable
 			if attempt < maxRetries {
-				// exponential backoff + jitter before next attempt
+				if c.Log != nil {
+					c.Log.Warn("LLM retry %d/%d: network error: %v", attempt+1, maxRetries, err)
+				}
 				c.backoffSleep(req.Context(), attempt, baseDelay, maxDelay)
 				continue
+			}
+			if c.Log != nil {
+				c.Log.Error("LLM exhausted retries: %v", err)
 			}
 			return resp, err
 		}
 		if !retryableStatus(resp.StatusCode) {
-			// Success or non-retryable client error
 			return resp, nil
 		}
 		// Retryable status — consume body so the connection can be reused
@@ -423,13 +430,17 @@ func (c *Client) retryDo(req *http.Request, bodyBytes []byte, maxRetries int) (*
 			resp.Body.Close()
 		}
 		if attempt >= maxRetries {
+			if c.Log != nil {
+				c.Log.Error("LLM failed after %d retries (last status %d)", maxRetries, resp.StatusCode)
+			}
 			return resp, fmt.Errorf("llm request failed after %d retries (last status %d)", maxRetries, resp.StatusCode)
 		}
-		// Backoff before next attempt
+		if c.Log != nil {
+			c.Log.Warn("LLM retry %d/%d: status=%d", attempt+1, maxRetries, resp.StatusCode)
+		}
 		c.backoffSleep(req.Context(), attempt, baseDelay, maxDelay)
 	}
 
-	// Unreachable, but the Go compiler doesn't know that.
 	return nil, lastErr
 }
 
@@ -456,13 +467,28 @@ func (c *Client) backoffSleep(ctx context.Context, attempt int, baseDelay, maxDe
 // Ready reports whether the client can make a request (i.e. required key set).
 func (c *Client) Ready() (bool, string) {
 	if c.RequiresKey && c.APIKey == "" {
-		return false, fmt.Sprintf("API key required for provider %q. Set WATERWRITER_LLM_API_KEY (or use provider \"ollama\" / a custom local endpoint).", c.Provider)
+		msg := fmt.Sprintf("API key required for provider %q. Set WATERWRITER_LLM_API_KEY (or use provider \"ollama\" / a custom local endpoint).", c.Provider)
+		if c.Log != nil {
+			c.Log.Warn("LLM not ready: %s", msg)
+		}
+		return false, msg
 	}
 	if c.BaseURL == "" {
-		return false, "no base URL configured. Set WATERWRITER_LLM_BASE_URL or choose a known provider."
+		msg := "no base URL configured. Set WATERWRITER_LLM_BASE_URL or choose a known provider."
+		if c.Log != nil {
+			c.Log.Warn("LLM not ready: %s", msg)
+		}
+		return false, msg
 	}
 	if c.Model == "" {
-		return false, "no model configured. Set WATERWRITER_LLM_MODEL."
+		msg := "no model configured. Set WATERWRITER_LLM_MODEL."
+		if c.Log != nil {
+			c.Log.Warn("LLM not ready: %s", msg)
+		}
+		return false, msg
+	}
+	if c.Log != nil {
+		c.Log.Info("LLM ready: provider=%s model=%s", c.Provider, c.Model)
 	}
 	return true, ""
 }
@@ -471,6 +497,9 @@ func (c *Client) Ready() (bool, string) {
 func (c *Client) Complete(ctx context.Context, messages []Message, temperature float64) (string, error) {
 	if temperature == 0 {
 		temperature = 0.7
+	}
+	if c.Log != nil {
+		c.Log.Info("LLM Complete: provider=%s model=%s temperature=%.1f messages=%d", c.Provider, c.Model, temperature, len(messages))
 	}
 	switch c.Style {
 	case StyleAnthropic:
@@ -536,6 +565,9 @@ func (c *Client) openAIComplete(ctx context.Context, messages []Message, tempera
 
 	resp, err := c.retryDo(req, reqBody, 4)
 	if err != nil {
+		if c.Log != nil {
+			c.Log.Error("LLM request failed after retries: %v", err)
+		}
 		return "", err
 	}
 	defer resp.Body.Close()
@@ -544,19 +576,35 @@ func (c *Client) openAIComplete(ctx context.Context, messages []Message, tempera
 		return "", err
 	}
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("llm request failed (%d): %s", resp.StatusCode, string(data))
+		err := fmt.Errorf("llm request failed (%d): %s", resp.StatusCode, string(data))
+		if c.Log != nil {
+			c.Log.Error("LLM non-200 response: %v", err)
+		}
+		return "", err
 	}
 	var out chatResponse
 	if err := json.Unmarshal(data, &out); err != nil {
 		return "", err
 	}
 	if out.Error != nil {
-		return "", fmt.Errorf("llm error: %s", out.Error.Message)
+		err := fmt.Errorf("llm error: %s", out.Error.Message)
+		if c.Log != nil {
+			c.Log.Error("LLM API error: %v", err)
+		}
+		return "", err
 	}
 	if len(out.Choices) == 0 {
-		return "", fmt.Errorf("llm returned no choices")
+		err := fmt.Errorf("llm returned no choices")
+		if c.Log != nil {
+			c.Log.Error("LLM empty choices")
+		}
+		return "", err
 	}
-	return strings.TrimSpace(out.Choices[0].Message.Content), nil
+	content := strings.TrimSpace(out.Choices[0].Message.Content)
+	if c.Log != nil {
+		c.Log.Info("LLM response: status=200 chars=%d", len(content))
+	}
+	return content, nil
 }
 
 func (c *Client) openAIStream(ctx context.Context, messages []Message, temperature float64, onChunk func(string) error) (string, error) {
@@ -567,6 +615,9 @@ func (c *Client) openAIStream(ctx context.Context, messages []Message, temperatu
 		Stream:          true,
 		ReasoningEffort: c.ThinkingEffort,
 	})
+	if c.Log != nil {
+		c.Log.Info("LLM streaming start: provider=%s model=%s", c.Provider, c.Model)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(reqBody))
 	if err != nil {
 		return "", err
@@ -576,12 +627,19 @@ func (c *Client) openAIStream(ctx context.Context, messages []Message, temperatu
 
 	resp, err := c.retryDo(req, reqBody, 4)
 	if err != nil {
+		if c.Log != nil {
+			c.Log.Error("LLM streaming failed after retries: %v", err)
+		}
 		return "", err
 	}
 	if resp.StatusCode != 200 {
 		data, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return "", fmt.Errorf("llm request failed (%d): %s", resp.StatusCode, string(data))
+		err := fmt.Errorf("llm request failed (%d): %s", resp.StatusCode, string(data))
+		if c.Log != nil {
+			c.Log.Error("LLM streaming non-200: %v", err)
+		}
+		return "", err
 	}
 	defer resp.Body.Close()
 
@@ -624,6 +682,10 @@ func (c *Client) openAIStream(ctx context.Context, messages []Message, temperatu
 				}
 			}
 		}
+	}
+	chars := sb.Len()
+	if c.Log != nil {
+		c.Log.Info("LLM streaming end: chars=%d", chars)
 	}
 	return sb.String(), nil
 }
@@ -822,10 +884,16 @@ type geminiGenConfig struct {
 	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
 }
 
+type geminiSafetySetting struct {
+	Category  string `json:"category"`
+	Threshold string `json:"threshold"`
+}
+
 type geminiRequest struct {
-	SystemInstruction *geminiContent  `json:"systemInstruction,omitempty"`
-	Contents          []geminiContent `json:"contents"`
-	GenerationConfig  geminiGenConfig `json:"generationConfig,omitempty"`
+	SystemInstruction *geminiContent       `json:"systemInstruction,omitempty"`
+	Contents          []geminiContent      `json:"contents"`
+	GenerationConfig  geminiGenConfig      `json:"generationConfig,omitempty"`
+	SafetySettings    []geminiSafetySetting `json:"safetySettings,omitempty"`
 }
 
 type geminiResponse struct {
@@ -835,6 +903,9 @@ type geminiResponse struct {
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+	PromptFeedback *struct {
+		BlockReason string `json:"blockReason"`
+	} `json:"promptFeedback"`
 }
 
 func geminiEndpoint(baseURL, model string, stream bool) string {
@@ -846,7 +917,8 @@ func geminiEndpoint(baseURL, model string, stream bool) string {
 
 // buildGeminiRequest converts OpenAI-style messages into a Gemini request.
 // System messages become the top-level systemInstruction; "assistant" is
-// mapped to Gemini's "model" role.
+// mapped to Gemini's "model" role. Safety filters are disabled so legitimate
+// book content (fiction, conflict, etc.) is not blocked.
 func buildGeminiRequest(messages []Message, temperature float64) geminiRequest {
 	var sys *geminiContent
 	var contents []geminiContent
@@ -868,10 +940,23 @@ func buildGeminiRequest(messages []Message, temperature float64) geminiRequest {
 			Parts: []geminiPart{{Text: m.Content}},
 		})
 	}
+
+	// Disable all safety categories so book content is not blocked.
+	// Gemini's default safety filters are strict and may block legitimate
+	// creative writing (fiction with conflict, crime, mature themes, etc.).
+	safety := []geminiSafetySetting{
+		{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_NONE"},
+		{Category: "HARM_CATEGORY_HATE_SPEECH", Threshold: "BLOCK_NONE"},
+		{Category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", Threshold: "BLOCK_NONE"},
+		{Category: "HARM_CATEGORY_DANGEROUS_CONTENT", Threshold: "BLOCK_NONE"},
+		{Category: "HARM_CATEGORY_CIVIC_INTEGRITY", Threshold: "BLOCK_NONE"},
+	}
+
 	return geminiRequest{
 		SystemInstruction: sys,
 		Contents:          contents,
 		GenerationConfig:  geminiGenConfig{Temperature: temperature, MaxOutputTokens: 8192},
+		SafetySettings:    safety,
 	}
 }
 
@@ -880,6 +965,9 @@ func geminiText(resp geminiResponse) (string, error) {
 		return "", fmt.Errorf("llm error: %s", resp.Error.Message)
 	}
 	if len(resp.Candidates) == 0 {
+		if resp.PromptFeedback != nil && resp.PromptFeedback.BlockReason != "" {
+			return "", fmt.Errorf("llm returned no candidates — blocked by safety filter (reason: %s)", resp.PromptFeedback.BlockReason)
+		}
 		return "", fmt.Errorf("llm returned no candidates")
 	}
 	var sb strings.Builder
@@ -979,6 +1067,9 @@ func (c *Client) geminiComplete(ctx context.Context, messages []Message, tempera
 // ListModels returns the model IDs the configured provider exposes. It talks to
 // each provider's models endpoint so users can discover what is available.
 func (c *Client) ListModels(ctx context.Context) ([]string, error) {
+	if c.Log != nil {
+		c.Log.Info("LLM listing models: provider=%s", c.Provider)
+	}
 	switch c.Style {
 	case StyleAnthropic:
 		return c.listAnthropicModels(ctx)
@@ -1003,6 +1094,9 @@ func (c *Client) listOpenAIModels(ctx context.Context) ([]string, error) {
 	} else {
 		url = c.BaseURL + "/models"
 	}
+	if c.Log != nil {
+		c.Log.Info("LLM querying models: url=%s", url)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -1017,7 +1111,11 @@ func (c *Client) listOpenAIModels(ctx context.Context) ([]string, error) {
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("model list failed (%d): %s", resp.StatusCode, string(data))
+		err := fmt.Errorf("model list failed (%d): %s", resp.StatusCode, string(data))
+		if c.Log != nil {
+			c.Log.Error("Model listing failed: %v", err)
+		}
+		return nil, err
 	}
 
 	if c.Provider == "ollama" {

@@ -33,7 +33,7 @@ func newTestAgent(t *testing.T) *agent.Agent {
 		t.Fatalf("open test db: %v", err)
 	}
 	t.Cleanup(func() { database.Close() })
-	return agent.New(nil, database)
+	return agent.New(nil, database, nil)
 }
 
 func TestQKeyDoesNotQuitInQAState(t *testing.T) {
@@ -43,7 +43,7 @@ func TestQKeyDoesNotQuitInQAState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := NewModel(ag, &db.Project{Name: "Test"})
+	m := NewModel(ag, &db.Project{Name: "Test"}, nil)
 	m.state = stateQA
 	m.questions = []string{"What is your book about?"}
 	m.qaIndex = 0
@@ -64,7 +64,7 @@ func TestQKeyDoesNotQuitInQAState(t *testing.T) {
 }
 
 func TestQKeyQuitsInNonInputStates(t *testing.T) {
-	m := NewModel(nil, &db.Project{Name: "Test"})
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateThink
 
 	keyMsg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")}
@@ -76,7 +76,7 @@ func TestQKeyQuitsInNonInputStates(t *testing.T) {
 }
 
 func TestEnterBlockedWithin50msOfLastChar(t *testing.T) {
-	m := NewModel(nil, &db.Project{Name: "Test"})
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateQA
 	m.questions = []string{"What is your book about?"}
 	m.qaIndex = 0
@@ -106,7 +106,7 @@ func TestEnterNotBlockedAfter50ms(t *testing.T) {
 	}
 	ag.DB.SaveQAQuestions(proj.ID, []string{"Q1"})
 
-	m := NewModel(ag, proj)
+	m := NewModel(ag, proj, nil)
 	m.state = stateQA
 	m.questions = []string{"Q1"}
 	m.qaIndex = 0
@@ -127,7 +127,7 @@ func TestEnterNotBlockedAfter50ms(t *testing.T) {
 }
 
 func TestQALastCharUpdatedOnKeyEvent(t *testing.T) {
-	m := NewModel(nil, &db.Project{Name: "Test"})
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateQA
 	m.questions = []string{"Q?"}
 	m.qaIndex = 0
@@ -143,7 +143,7 @@ func TestQALastCharUpdatedOnKeyEvent(t *testing.T) {
 }
 
 func TestEnterNotBlockedWhenNotPasting(t *testing.T) {
-	m := NewModel(nil, &db.Project{Name: "Test"})
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateQA
 	m.questions = []string{"What is your book about?"}
 	m.qaIndex = 0
@@ -169,7 +169,7 @@ func TestEnterWithAnswerReturnsAsyncSaveCmd(t *testing.T) {
 	}
 	ag.DB.SaveQAQuestions(proj.ID, []string{"Q1", "Q2"})
 
-	m := NewModel(ag, proj)
+	m := NewModel(ag, proj, nil)
 	m.state = stateQA
 	m.questions = []string{"Q1", "Q2"}
 	m.qaIndex = 0
@@ -219,7 +219,7 @@ func TestEnterWithAnswerOnLastQuestionGoesToReview(t *testing.T) {
 	}
 	ag.DB.SaveQAQuestions(proj.ID, []string{"Only question"})
 
-	m := NewModel(ag, proj)
+	m := NewModel(ag, proj, nil)
 	m.state = stateQA
 	m.questions = []string{"Only question"}
 	m.qaIndex = 0
@@ -267,7 +267,7 @@ func TestEnterWithAnswerOnLastQuestionGoesToReview(t *testing.T) {
 }
 
 func TestEnterOnErrorGoesToHome(t *testing.T) {
-	m := NewModel(nil, &db.Project{Name: "Test"})
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateError
 	m.err = fmt.Errorf("test error")
 
@@ -284,7 +284,7 @@ func TestEnterOnErrorGoesToHome(t *testing.T) {
 }
 
 func TestQQuitsFromError(t *testing.T) {
-	m := NewModel(nil, &db.Project{Name: "Test"})
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateError
 	m.err = fmt.Errorf("test error")
 
@@ -297,7 +297,7 @@ func TestQQuitsFromError(t *testing.T) {
 }
 
 func TestCtrlCQuitsFromError(t *testing.T) {
-	m := NewModel(nil, &db.Project{Name: "Test"})
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateError
 	m.err = fmt.Errorf("test error")
 
@@ -310,7 +310,7 @@ func TestCtrlCQuitsFromError(t *testing.T) {
 }
 
 func TestErrorViewShowsError(t *testing.T) {
-	m := NewModel(nil, &db.Project{Name: "Test"})
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateError
 	m.err = fmt.Errorf("API call failed: 503 Service Unavailable")
 	m.width = 80
@@ -329,7 +329,7 @@ func TestErrorViewShowsError(t *testing.T) {
 }
 
 func TestCtrlCAlwaysQuits(t *testing.T) {
-	m := NewModel(nil, &db.Project{Name: "Test"})
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateQA
 	m.questions = []string{"What is your book about?"}
 	m.qaIndex = 0
@@ -389,7 +389,7 @@ func TestHomeExportFlow(t *testing.T) {
 	ag.DB.UpdateSubchapterContent(3, "Advanced topics content.")
 
 	// Create the home model with projects pre-loaded.
-	m := NewHomeModel(ag, true, "")
+	m := NewHomeModel(ag, nil, true, "")
 	m.width = 80
 	m.height = 24
 	m.projects = []*db.Project{{ID: 1, Name: "ExportTest"}}
@@ -573,7 +573,7 @@ func TestHomeExportFlowNoBook(t *testing.T) {
 	}
 
 	// Create home model with just the project name (no book, chapters, or subchapters).
-	m := NewHomeModel(ag, true, "")
+	m := NewHomeModel(ag, nil, true, "")
 	m.width = 80
 	m.height = 24
 	m.project = proj
@@ -639,7 +639,7 @@ func TestHomeExportProjectNotSelected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := NewHomeModel(ag, true, "")
+	m := NewHomeModel(ag, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "TestProj"}}
 	m.cursor = 0 // cursor on "Create a new book"
 
@@ -656,7 +656,7 @@ func TestHomeExportProjectNotSelected(t *testing.T) {
 	}
 
 	// Also test cursor on "Configure LLM" (last item)
-	m2 := NewHomeModel(ag, true, "")
+	m2 := NewHomeModel(ag, nil, true, "")
 	m2.projects = []*db.Project{{ID: 1, Name: "TestProj"}}
 	m2.cursor = 2 // cursor on "Configure LLM" (len(projects)+1 = 2)
 
@@ -675,7 +675,7 @@ func TestHomeExportProjectNotSelected(t *testing.T) {
 // TestHomePressEOnProjectStartsExport verifies that pressing 'e' when the cursor
 // is on a project sets homeExporting=true and pre-fills the input with ".".
 func TestHomePressEOnProjectStartsExport(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 
@@ -707,7 +707,7 @@ func TestHomePressEOnProjectStartsExport(t *testing.T) {
 // export mode returns a non-nil command (the exportHomeBook closure).
 // With the two-step flow (path → subs choice → export), two Enter presses are needed.
 func TestHomeExportEnterFiresExportCmd(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExporting = true
@@ -764,7 +764,7 @@ func TestHomeExportEnterFiresExportCmd(t *testing.T) {
 // with an empty input defaults the export path to ".".
 // With the two-step flow (path → subs choice → export), two Enter presses are needed.
 func TestHomeExportEnterWithEmptyPathDefaultsToDot(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExporting = true
@@ -807,7 +807,7 @@ func TestHomeExportEnterWithEmptyPathDefaultsToDot(t *testing.T) {
 // TestHomeExportEscCancels verifies that pressing Esc while in export mode
 // cancels the export and clears all export state fields.
 func TestHomeExportEscCancels(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExporting = true
@@ -839,7 +839,7 @@ func TestHomeExportEscCancels(t *testing.T) {
 // TestHomeExportEnterOnResultOverlayClears verifies that pressing Enter on the
 // export success/error overlay clears the result and returns to the project list.
 func TestHomeExportEnterOnResultOverlayClears(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExportResult = "/tmp/test_export/MyBook/book.md" // simulate success
@@ -863,7 +863,7 @@ func TestHomeExportEnterOnResultOverlayClears(t *testing.T) {
 // TestHomeExportEnterOnErrorOverlayClears verifies that pressing Enter on an
 // export error overlay also clears the result and returns to the project list.
 func TestHomeExportEnterOnErrorOverlayClears(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExportResult = ""
@@ -888,7 +888,7 @@ func TestHomeExportEnterOnErrorOverlayClears(t *testing.T) {
 // the export result overlay clears the result and lets the navigation 'e'
 // handler start a new export (cursor is still on the same project).
 func TestHomeExportEPressedOnResultOverlayRetries(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExportResult = "/tmp/test_export/MyBook/book.md" // had a successful export
@@ -911,7 +911,7 @@ func TestHomeExportEPressedOnResultOverlayRetries(t *testing.T) {
 // TestHomeExportEPressedOnErrorOverlayRetries verifies that pressing 'e' on the
 // export error overlay clears the error and retries (starts a new export).
 func TestHomeExportEPressedOnErrorOverlayRetries(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExportError = fmt.Errorf("write failed: disk full") // had an error
@@ -933,7 +933,7 @@ func TestHomeExportEPressedOnErrorOverlayRetries(t *testing.T) {
 // TestHomeExportQOnResultOverlayQuits verifies that pressing 'q' on the
 // export result or error overlay quits the app.
 func TestHomeExportQOnResultOverlayQuits(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExportResult = "/tmp/exported.md"
@@ -946,7 +946,7 @@ func TestHomeExportQOnResultOverlayQuits(t *testing.T) {
 	}
 
 	// Also test 'q' on error overlay quits.
-	m2 := NewHomeModel(nil, true, "")
+	m2 := NewHomeModel(nil, nil, true, "")
 	m2.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m2.cursor = 1
 	m2.homeExportError = fmt.Errorf("some error")
@@ -960,7 +960,7 @@ func TestHomeExportQOnResultOverlayQuits(t *testing.T) {
 // TestHomeExportCtrlCOnPathEntryQuits verifies that Ctrl+C during path entry
 // quits the app (not just cancel the export).
 func TestHomeExportCtrlCOnPathEntryQuits(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExporting = true
@@ -976,7 +976,7 @@ func TestHomeExportCtrlCOnPathEntryQuits(t *testing.T) {
 // TestHomeExportRandomKeyOnResultOverlayIgnored verifies that random keys on
 // the result overlay are ignored (no crash, no state change).
 func TestHomeExportRandomKeyOnResultOverlayIgnored(t *testing.T) {
-	m := NewHomeModel(nil, true, "")
+	m := NewHomeModel(nil, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExportResult = "/tmp/exported.md"
@@ -998,7 +998,7 @@ func TestHomeExportRandomKeyOnResultOverlayIgnored(t *testing.T) {
 // success message when homeExportResult is set.
 func TestHomeExportViewShowsSuccessOverlay(t *testing.T) {
 	ag := newTestAgent(t)
-	m := NewHomeModel(ag, true, "")
+	m := NewHomeModel(ag, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExportResult = "/tmp/MyBook/book.md"
@@ -1021,7 +1021,7 @@ func TestHomeExportViewShowsSuccessOverlay(t *testing.T) {
 // error message when homeExportError is set.
 func TestHomeExportViewShowsErrorOverlay(t *testing.T) {
 	ag := newTestAgent(t)
-	m := NewHomeModel(ag, true, "")
+	m := NewHomeModel(ag, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExportError = fmt.Errorf("write failed: disk full")
@@ -1044,7 +1044,7 @@ func TestHomeExportViewShowsErrorOverlay(t *testing.T) {
 // directory input prompt when homeExporting is true.
 func TestHomeExportViewShowsPathInput(t *testing.T) {
 	ag := newTestAgent(t)
-	m := NewHomeModel(ag, true, "")
+	m := NewHomeModel(ag, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}}
 	m.cursor = 1
 	m.homeExporting = true
@@ -1071,7 +1071,7 @@ func TestHomeExportViewShowsExportHint(t *testing.T) {
 	ag.DB.CreateProject("MyBook")
 	ag.DB.CreateProject("OtherBook")
 
-	m := NewHomeModel(ag, true, "")
+	m := NewHomeModel(ag, nil, true, "")
 	m.projects = []*db.Project{{ID: 1, Name: "MyBook"}, {ID: 2, Name: "OtherBook"}}
 	m.cursor = 2 // cursor on OtherBook
 	m.width = 80

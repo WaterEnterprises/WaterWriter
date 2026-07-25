@@ -16,7 +16,10 @@ var createCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		name := args[0]
-		_, llmClient, ag, err := initApp()
+		logger, llmClient, ag, err := initApp()
+		if logger != nil {
+			defer logger.Close()
+		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
@@ -33,7 +36,7 @@ var createCmd = &cobra.Command{
 		}
 		fmt.Printf("Project %q created.\n", name)
 
-		model := tui.NewModel(ag, project)
+		model := tui.NewModel(ag, project, logger)
 		p := tea.NewProgram(model, tea.WithAltScreen())
 		if _, err := p.Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)

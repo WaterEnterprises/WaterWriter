@@ -14,6 +14,7 @@ import (
 	"github.com/WaterEnterprises/WaterWriter/internal/db"
 	"github.com/WaterEnterprises/WaterWriter/internal/llm"
 	"github.com/WaterEnterprises/WaterWriter/internal/dict"
+	"github.com/WaterEnterprises/WaterWriter/internal/log"
 	"github.com/ZeroHawkeye/wordZero/pkg/document"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -110,6 +111,7 @@ var (
 
 type Model struct {
 	agent   *agent.Agent
+	logger  *log.Logger
 	project *db.Project
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -185,6 +187,7 @@ type Model struct {
 	configModel        string   // entered model
 	configModels       []string // fetched model list
 	configModelCursor  int      // cursor for model list
+	configModelTyping  bool     // true = typing model name manually instead of scrolling
 	configLoading      bool     // loading models from API
 	configLoadErr      string   // error from model loading
 	configThinkingEff  int      // 0=default, 1=low, 2=medium, 3=high
@@ -195,7 +198,7 @@ type Model struct {
 	doneSubs  int
 }
 
-func NewModel(ag *agent.Agent, proj *db.Project) *Model {
+func NewModel(ag *agent.Agent, proj *db.Project, logger *log.Logger) *Model {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := spinner.NewModel()
 	s.Spinner = spinner.Dot
@@ -207,6 +210,7 @@ func NewModel(ag *agent.Agent, proj *db.Project) *Model {
 
 	m := &Model{
 		agent:     ag,
+		logger:    logger,
 		project:   proj,
 		ctx:       ctx,
 		cancel:    cancel,
@@ -222,8 +226,8 @@ func NewModel(ag *agent.Agent, proj *db.Project) *Model {
 // NewHomeModel creates a model that starts on the home screen (project picker).
 // llmReady indicates the LLM client is configured (API key present).
 // llmWarning is a message shown when the LLM is not configured.
-func NewHomeModel(ag *agent.Agent, llmReady bool, llmWarning string) *Model {
-	m := NewModel(ag, &db.Project{Name: "Water Writer"})
+func NewHomeModel(ag *agent.Agent, logger *log.Logger, llmReady bool, llmWarning string) *Model {
+	m := NewModel(ag, &db.Project{Name: "Water Writer"}, logger)
 	m.state = stateHome
 	m.projects = nil
 	m.cursor = 0
@@ -459,6 +463,7 @@ func (m *Model) startConfig(pending string) {
 	m.configModel = ""
 	m.configModels = nil
 	m.configModelCursor = 0
+	m.configModelTyping = false
 	m.configLoading = false
 	m.configLoadErr = ""
 	m.configThinkingEff = 3 // default to High
@@ -529,12 +534,40 @@ func (m *Model) handleConfigKey(msg tea.KeyMsg) tea.Cmd {
 		}
 
 	case 2: // Model picker (from API query)
-		// If loading or error, don't process keyboard navigation
+		// If loading, don't process keyboard input.
 		if m.configLoading {
 			return nil
 		}
+
+		// If in manual typing mode, Enter confirms the typed model name.
+		if m.configModelTyping {
+			switch msg.String() {
+			case "ctrl+c":
+				m.cancel()
+				return tea.Quit
+			case "esc":
+				// Go back to list navigation
+				m.configModelTyping = false
+				m.input.SetValue("")
+				return nil
+			case "enter":
+				entered := strings.TrimSpace(m.input.Value())
+				if entered != "" {
+					m.configModel = entered
+					m.configStep = 3
+					m.configModelTyping = false
+					return nil
+				}
+				return nil
+			default:
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				return cmd
+			}
+		}
+
+		// If in error fallback mode (model query failed), use manual text entry.
 		if m.configLoadErr != "" {
-			// Fall back to manual text entry on error
 			switch msg.String() {
 			case "ctrl+c":
 				m.cancel()
@@ -557,7 +590,8 @@ func (m *Model) handleConfigKey(msg tea.KeyMsg) tea.Cmd {
 				return cmd
 			}
 		}
-		// Normal model list navigation
+
+		// Normal model list navigation (and switch to typing mode via "/").
 		switch msg.String() {
 		case "ctrl+c":
 			m.cancel()
@@ -576,6 +610,12 @@ func (m *Model) handleConfigKey(msg tea.KeyMsg) tea.Cmd {
 			if m.configModelCursor < len(m.configModels)-1 {
 				m.configModelCursor++
 			}
+			return nil
+		case "/":
+			// Switch to manual model name entry.
+			m.configModelTyping = true
+			m.input.SetValue("")
+			m.input.Placeholder = "Paste or type model name..."
 			return nil
 		case "enter":
 			if m.configModelCursor >= 0 && m.configModelCursor < len(m.configModels) {
@@ -1068,6 +1108,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.state = stateError
 		m.err = msg.err
+		m.log(fmt.Sprintf("ERROR: %v", msg.err))
 		return m, nil
 
 	// Export done
@@ -1120,7 +1161,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // --- Commands ---
 
 func (m Model) setupQA() tea.Cmd {
-	return func() tea.Msg {
+	return safeCmd(func() tea.Msg {
 		questions, err := m.agent.DB.GetQAQuestions(m.project.ID)
 		if err != nil || len(questions) == 0 {
 			questions, err = m.agent.GenerateQuestions(m.ctx, 8)
@@ -1140,11 +1181,25 @@ func (m Model) setupQA() tea.Cmd {
 			index = len(questions)
 		}
 		return qaReadyMsg{questions: questions, answers: pairs, index: index}
+	})
+}
+
+// safeCmd wraps a tea.Cmd with panic recovery. If the command function panics
+// (e.g. from a nil pointer dereference or unexpected API response), the panic
+// is caught and returned as an errMsg instead of crashing the entire app.
+func safeCmd(f func() tea.Msg) tea.Cmd {
+	return func() (msg tea.Msg) {
+		defer func() {
+			if r := recover(); r != nil {
+				msg = errMsg{fmt.Errorf("internal error: %v", r)}
+			}
+		}()
+		return f()
 	}
 }
 
 func (m Model) compileBrief() tea.Cmd {
-	return func() tea.Msg {
+	return safeCmd(func() tea.Msg {
 		pairs, err := m.agent.DB.GetQAPairs(m.project.ID)
 		if err != nil {
 			return errMsg{err}
@@ -1158,11 +1213,11 @@ func (m Model) compileBrief() tea.Cmd {
 		}
 		m.agent.DB.UpdateProjectStatus(m.project.ID, "brief")
 		return briefDoneMsg{}
-	}
+	})
 }
 
 func (m Model) loadQAndGenerateTitleTOC() tea.Cmd {
-	return func() tea.Msg {
+	return safeCmd(func() tea.Msg {
 		pairs, err := m.agent.DB.GetQAPairs(m.project.ID)
 		if err != nil {
 			return errMsg{err}
@@ -1199,11 +1254,11 @@ func (m Model) loadQAndGenerateTitleTOC() tea.Cmd {
 		}
 		m.agent.DB.UpdateProjectStatus(m.project.ID, "titletoc")
 		return titleTOCDoneMsg{}
-	}
+	})
 }
 
 func (m Model) generateTitleTOC() tea.Cmd {
-	return func() tea.Msg {
+	return safeCmd(func() tea.Msg {
 		brief, err := m.agent.DB.GetBrief(m.project.ID)
 		if err != nil {
 			return errMsg{err}
@@ -1225,11 +1280,11 @@ func (m Model) generateTitleTOC() tea.Cmd {
 		}
 		m.agent.DB.UpdateProjectStatus(m.project.ID, "titletoc")
 		return titleTOCDoneMsg{}
-	}
+	})
 }
 
 func (m Model) generateAllSubchapters() tea.Cmd {
-	return func() tea.Msg {
+	return safeCmd(func() tea.Msg {
 		brief, err := m.agent.DB.GetBrief(m.project.ID)
 		if err != nil {
 			return errMsg{err}
@@ -1264,7 +1319,7 @@ func (m Model) generateAllSubchapters() tea.Cmd {
 		}
 		m.agent.DB.UpdateProjectStatus(m.project.ID, "subchapters")
 		return subchaptersDoneMsg{}
-	}
+	})
 }
 
 func (m *Model) loadChapters() {
@@ -1324,6 +1379,14 @@ func (m *Model) beginWrite() tea.Cmd {
 	m.streamCh = ch
 
 	go func() {
+		// Panic recovery for the write goroutine so a crash doesn't kill the app.
+		defer func() {
+			if r := recover(); r != nil {
+				ch <- streamMsg{end: true, ci: ci, si: si, err: fmt.Errorf("internal error: %v", r)}
+				close(ch)
+			}
+		}()
+
 		chapter := m.chapters[ci]
 		sub := chapter.subs[si]
 		dbChapter := &db.Chapter{ID: chapter.id, Title: chapter.title}
@@ -1360,7 +1423,7 @@ func (m Model) listenStream() tea.Cmd {
 // exportHomeBook builds the full book markdown for the current project and writes it.
 // Works for any project, even unfinished ones — exports whatever content exists.
 func (m *Model) exportHomeBook() tea.Cmd {
-	return func() tea.Msg {
+	return safeCmd(func() tea.Msg {
 		projectID := m.project.ID
 		book, err := m.agent.DB.GetBook(projectID)
 		if err != nil {
@@ -1373,7 +1436,7 @@ func (m *Model) exportHomeBook() tea.Cmd {
 			return exportDoneMsg{err: fmt.Errorf("get chapters: %w", err)}
 		}
 		return m.writeExportFile(m.homeExportPath, book.Title, book.Subtitle, chapters)
-	}
+	})
 }
 
 // writeExportFile is shared by both the done-screen and home-screen export flows.
@@ -1522,7 +1585,7 @@ func (m *Model) writeDocxFile(outDir, title, subtitle string, chapters []*db.Cha
 
 // exportBook builds the full book markdown and writes it to the export path.
 func (m *Model) exportBook() tea.Cmd {
-	return func() tea.Msg {
+	return safeCmd(func() tea.Msg {
 		book, err := m.agent.DB.GetBook(m.project.ID)
 		if err != nil {
 			return exportDoneMsg{err: fmt.Errorf("get book: %w", err)}
@@ -1532,7 +1595,7 @@ func (m *Model) exportBook() tea.Cmd {
 			return exportDoneMsg{err: fmt.Errorf("get chapters: %w", err)}
 		}
 		return m.writeExportFile(m.exportPath, book.Title, book.Subtitle, chapters)
-	}
+	})
 }
 
 // cleanContent strips leading #-style markdown headings from text content.
@@ -1709,25 +1772,68 @@ func (m Model) configView() string {
 			b.WriteString(dimStyle.Render(fmt.Sprintf("  Default: %s", preset.DefaultModel)))
 			b.WriteString("\n")
 			b.WriteString(dimStyle.Render("  [Enter] continue   •   [Esc] change API key   •   [Ctrl+C] quit"))
+		} else if m.configModelTyping {
+			// Manual model name entry mode.
+			b.WriteString("\n")
+			b.WriteString(" Type or paste the model name:\n\n")
+			b.WriteString(fmt.Sprintf("  %s\n", m.input.View()))
+			b.WriteString("\n")
+			b.WriteString(dimStyle.Render("  [Enter] confirm   •   [Esc] back to list   •   [Ctrl+C] quit"))
 		} else {
 			b.WriteString(" Select a model:\n\n")
-			const maxShow = 50
-			shown := m.configModels
-			if len(shown) > maxShow {
-				shown = shown[:maxShow]
+
+			const windowSize = 50
+			total := len(m.configModels)
+			cursor := m.configModelCursor
+
+			// Calculate the scroll window so the cursor stays roughly centered.
+			// If the list is smaller than the window, show everything.
+			// Otherwise, slide the window to keep the cursor visible.
+			var start, end int
+			if total <= windowSize {
+				start = 0
+				end = total
+			} else {
+				// Try to center the cursor in the window.
+				half := windowSize / 2
+				start = cursor - half
+				if start < 0 {
+					start = 0
+				}
+				end = start + windowSize
+				if end > total {
+					end = total
+					start = total - windowSize
+				}
 			}
+
+			shown := m.configModels[start:end]
+
+			// Show "more above" indicator if we're not at the top.
+			if start > 0 {
+				b.WriteString(fmt.Sprintf("  ↑ ... (%d more above)\n", start))
+			}
+
 			for i, model := range shown {
 				prefix := "  "
-				if m.configModelCursor == i {
+				if start+i == cursor {
 					prefix = "> "
 				}
 				b.WriteString(fmt.Sprintf("%s%s\n", prefix, model))
 			}
-			if len(m.configModels) > maxShow {
-				b.WriteString(fmt.Sprintf("  ... (%d more not shown)\n", len(m.configModels)-maxShow))
+
+			// Show "more below" indicator if we're not at the bottom.
+			if end < total {
+				b.WriteString(fmt.Sprintf("  ↓ ... (%d more below)\n", total-end))
 			}
+
+			// Show position info.
+			if total > 1 {
+				b.WriteString(fmt.Sprintf("\n %s\n", dimStyle.Render(fmt.Sprintf("Model %d of %d", cursor+1, total))))
+			}
+
 			b.WriteString("\n")
-			b.WriteString(dimStyle.Render("  [↑/↓] move   •   [Enter] select   •   [Esc] back   •   [Ctrl+C] quit"))
+			b.WriteString(dimStyle.Render("  [/] type   •   [↑/↓] move   •   [Enter] select   •   [Esc] back   •   [Ctrl+C] quit"))
 		}
 
 	case 3: // Thinking effort picker
@@ -2082,7 +2188,7 @@ func (m *Model) configLoadModelsCmd() tea.Cmd {
 	apiKey := m.configAPIKey
 	preset := llm.Providers[provider]
 
-	return func() tea.Msg {
+	return safeCmd(func() tea.Msg {
 		tmpClient := llm.NewClientFromConfig(llm.Config{
 			Provider: provider,
 			APIKey:   apiKey,
@@ -2101,7 +2207,7 @@ func (m *Model) configLoadModelsCmd() tea.Cmd {
 		copy(out, models)
 		sort.Strings(out)
 		return modelsLoadedMsg{models: out, err: nil}
-	}
+	})
 }
 
 // saveConfig persists the wizard's choices and re-initializes the LLM client.
@@ -2169,6 +2275,10 @@ func (m Model) errorView() string {
 
 func (m *Model) log(text string) {
 	m.logLines = append(m.logLines, text)
+	// Also write to the file logger (it timestamps and persists).
+	if m.logger != nil {
+		m.logger.Info("%s", text)
+	}
 }
 
 func progressBar(pct int, width int) string {

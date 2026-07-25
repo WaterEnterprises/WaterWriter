@@ -11,6 +11,7 @@ import (
 	"github.com/WaterEnterprises/WaterWriter/internal/agent"
 	"github.com/WaterEnterprises/WaterWriter/internal/db"
 	"github.com/WaterEnterprises/WaterWriter/internal/llm"
+	"github.com/WaterEnterprises/WaterWriter/internal/log"
 	"github.com/WaterEnterprises/WaterWriter/internal/tui"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/term"
@@ -47,7 +48,10 @@ then writes each subchapter in a fully autonomous workflow.`,
 				os.Exit(0)
 			}
 		}
-		_, llmClient, ag, err := initApp()
+		logger, llmClient, ag, err := initApp()
+		if logger != nil {
+			defer logger.Close()
+		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
@@ -58,7 +62,7 @@ then writes each subchapter in a fully autonomous workflow.`,
 			llmReady = false
 			llmWarning = msg
 		}
-		model := tui.NewHomeModel(ag, llmReady, llmWarning)
+		model := tui.NewHomeModel(ag, logger, llmReady, llmWarning)
 		p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 		if _, err := p.Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
@@ -106,11 +110,21 @@ func defaultDBPath() string {
 	return filepath.Join(dir, "waterwriter.db")
 }
 
-func initApp() (*db.DB, *llm.Client, *agent.Agent, error) {
+func initApp() (*log.Logger, *llm.Client, *agent.Agent, error) {
 	godotenv.Load()
+
+	// Initialize the file logger. Fail gracefully on error (logging is optional).
+	logger, err := log.New(log.DefaultLogPath())
+	if err != nil {
+		// Logging is best-effort; continue without it.
+		fmt.Fprintf(os.Stderr, "Warning: could not create logger: %v\n", err)
+	}
 
 	database, err := db.Open(dbPath)
 	if err != nil {
+		if logger != nil {
+			logger.Close()
+		}
 		return nil, nil, nil, fmt.Errorf("open database: %w", err)
 	}
 
@@ -134,8 +148,12 @@ func initApp() (*db.DB, *llm.Client, *agent.Agent, error) {
 		ExtraHeaders:   os.Getenv("WATERWRITER_LLM_EXTRA_HEADERS"),
 	}
 	llmClient := llm.NewClientFromConfig(cfg)
-	ag := agent.New(llmClient, database)
-	return database, llmClient, ag, nil
+	ag := agent.New(llmClient, database, logger)
+	if logger != nil {
+		logger.Info("Water Writer started: provider=%s model=%s", cfg.Provider, cfg.Model)
+		logger.Info("Database: %s", dbPath)
+	}
+	return logger, llmClient, ag, nil
 }
 
 func firstNonEmpty(vals ...string) string {
