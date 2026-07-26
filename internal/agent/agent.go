@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/WaterEnterprises/WaterWriter/internal/db"
@@ -22,6 +23,48 @@ func New(llmClient *llm.Client, database *db.DB, logger *log.Logger) *Agent {
 		llmClient.Log = logger // Wire logger into the LLM client too.
 	}
 	return &Agent{LLM: llmClient, DB: database, Log: logger}
+}
+
+// trailingCommaRe matches a comma followed by optional whitespace and a
+// closing bracket or brace — the classic LLM JSON trailing-comma bug.
+var trailingCommaRe = regexp.MustCompile(`,(\s*[\]\}])`)
+
+// cleanJSON fixes common LLM JSON formatting mistakes so Go's strict
+// json.Unmarshal can parse it. Currently handles:
+//   - Trailing commas: ["a", "b",] → ["a", "b"]
+//   - Braces used as brackets: {"a", "b"} → ["a", "b"]
+func cleanJSON(s string) string {
+	s = trailingCommaRe.ReplaceAllString(s, "$1")
+	// LLMs sometimes output {…} instead of […] for arrays (no key-value pairs).
+	// If there are no colons outside quoted strings, convert braces to brackets.
+	s = fixBraceArray(s)
+	return s
+}
+
+// fixBraceArray detects cases where the LLM used {…} instead of […] for an
+// array of strings. If the content has no colon outside of quoted strings,
+// it's likely meant to be an array — replace outermost { } with [ ].
+func fixBraceArray(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "{") || !strings.HasSuffix(s, "}") {
+		return s
+	}
+	inString := false
+	hasColon := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' {
+			inString = !inString
+		}
+		if !inString && s[i] == ':' {
+			hasColon = true
+			break
+		}
+	}
+	if !hasColon {
+		// Replace outermost braces with brackets.
+		s = "[" + s[1:len(s)-1] + "]"
+	}
+	return s
 }
 
 func extractJSON(s string) string {
@@ -43,10 +86,10 @@ func extractJSON(s string) string {
 			}
 		}
 		if start < end {
-			return strings.TrimSpace(strings.Join(lines[start:end], "\n"))
+			return cleanJSON(strings.TrimSpace(strings.Join(lines[start:end], "\n")))
 		}
 	}
-	return s
+	return cleanJSON(s)
 }
 
 func (a *Agent) GenerateQuestions(ctx context.Context, count int) ([]string, error) {
@@ -228,6 +271,117 @@ func (a *Agent) BuildWriteContext(ctx context.Context, projectID int, chapter *d
 	contextBuilder.WriteString("Maintain consistent voice, style, and continuity. Write in rich markdown prose. Aim for 800-1500 words. Do not repeat previous content. End naturally.")
 
 	return contextBuilder.String(), nil
+}
+
+// TranslateTitleTOC translates the book title, subtitle, and all chapter titles
+// into the target language in a single LLM call for context consistency.
+func (a *Agent) TranslateTitleTOC(ctx context.Context, language string, bookTitle, subtitle string, chapters []*db.Chapter) ([]string, error) {
+	if a.Log != nil {
+		a.Log.Info("Agent: translating title/TOC to %q", language)
+	}
+	var tocBuilder strings.Builder
+	fmt.Fprintf(&tocBuilder, "Title: %s\n", bookTitle)
+	if subtitle != "" {
+		fmt.Fprintf(&tocBuilder, "Subtitle: %s\n", subtitle)
+	}
+	tocBuilder.WriteString("Chapters:\n")
+	for i, ch := range chapters {
+		fmt.Fprintf(&tocBuilder, "%d. %s\n", i+1, ch.Title)
+	}
+
+	sys := fmt.Sprintf("You are a professional literary translator. Translate the following book title, subtitle, and chapter titles into %s. Preserve the tone, style, and cultural nuances. Return ONLY a JSON object with keys: title (string), subtitle (string, empty if none), chapters (array of strings in the same order). No markdown fences.", language)
+	result, err := a.LLM.Complete(ctx, []llm.Message{
+		{Role: "system", Content: sys},
+		{Role: "user", Content: tocBuilder.String()},
+	}, 0.3)
+	if err != nil {
+		if a.Log != nil {
+			a.Log.Error("Agent: TranslateTitleTOC failed: %v", err)
+		}
+		return nil, fmt.Errorf("translate title/toc: %w", err)
+	}
+	result = extractJSON(result)
+
+	var resp struct {
+		Title    string   `json:"title"`
+		Subtitle string   `json:"subtitle"`
+		Chapters []string `json:"chapters"`
+	}
+	if err := json.Unmarshal([]byte(result), &resp); err != nil {
+		if a.Log != nil {
+			a.Log.Error("Agent: failed to parse translated title/TOC JSON: %v", err)
+		}
+		return nil, fmt.Errorf("parse translated title/toc: %w\nraw: %s", err, result)
+	}
+	if a.Log != nil {
+		a.Log.Info("Agent: translated title=%q subtitle=%q chapters=%d", resp.Title, resp.Subtitle, len(resp.Chapters))
+	}
+	// Return [title, subtitle, chapters...] for convenience.
+	out := []string{resp.Title, resp.Subtitle}
+	out = append(out, resp.Chapters...)
+	return out, nil
+}
+
+// TranslateSubchapterContent translates a single subchapter's content into the
+// target language, with the book context provided for consistency.
+func (a *Agent) TranslateSubchapterContent(ctx context.Context, language, bookTitle, subtitle, chapterTitle, subchapterTitle, content string) (string, error) {
+	if a.Log != nil {
+		a.Log.Info("Agent: translating subchapter %q / %q to %q (%d chars)", chapterTitle, subchapterTitle, language, len(content))
+	}
+	user := fmt.Sprintf("Book: %s\n", bookTitle)
+	if subtitle != "" {
+		user += fmt.Sprintf("Subtitle: %s\n", subtitle)
+	}
+	user += fmt.Sprintf("Chapter: %s\n", chapterTitle)
+	user += fmt.Sprintf("Section: %s\n\n", subchapterTitle)
+	user += content
+
+	sys := fmt.Sprintf("You are a professional literary translator. Translate the following book section into %s. Preserve the author's voice, tone, style, and cultural references. Do NOT add any notes, commentary, or markdown formatting. Translate only the text content. Keep paragraph structure intact.", language)
+	result, err := a.LLM.Complete(ctx, []llm.Message{
+		{Role: "system", Content: sys},
+		{Role: "user", Content: user},
+	}, 0.3)
+	if err != nil {
+		if a.Log != nil {
+			a.Log.Error("Agent: TranslateSubchapterContent for %q / %q failed: %v", chapterTitle, subchapterTitle, err)
+		}
+		return "", fmt.Errorf("translate subchapter: %w", err)
+	}
+	if a.Log != nil {
+		a.Log.Info("Agent: translated subchapter successfully (%d chars)", len(result))
+	}
+	return result, nil
+}
+
+// TranslateSubchapterContentStream translates a subchapter's content into the
+// target language with the book context, streaming chunks via onChunk.
+func (a *Agent) TranslateSubchapterContentStream(ctx context.Context, language, bookTitle, subtitle, chapterTitle, subchapterTitle, content string, onChunk func(string) error) (string, error) {
+	if a.Log != nil {
+		a.Log.Info("Agent: streaming translation of subchapter %q / %q to %q (%d chars)", chapterTitle, subchapterTitle, language, len(content))
+	}
+	user := fmt.Sprintf("Book: %s\n", bookTitle)
+	if subtitle != "" {
+		user += fmt.Sprintf("Subtitle: %s\n", subtitle)
+	}
+	user += fmt.Sprintf("Chapter: %s\n", chapterTitle)
+	user += fmt.Sprintf("Section: %s\n\n", subchapterTitle)
+	user += content
+
+	sys := fmt.Sprintf("You are a professional literary translator. Translate the following book section into %s. Preserve the author's voice, tone, style, and cultural references. Do NOT add any notes, commentary, or markdown formatting. Translate only the text content. Keep paragraph structure intact.", language)
+	result, err := a.LLM.CompleteStream(ctx, []llm.Message{
+		{Role: "system", Content: sys},
+		{Role: "user", Content: user},
+	}, 0.3, onChunk)
+	if err != nil {
+		if a.Log != nil {
+			a.Log.Error("Agent: TranslateSubchapterContentStream for %q / %q failed: %v", chapterTitle, subchapterTitle, err)
+		}
+		return result, fmt.Errorf("translate subchapter stream: %w", err)
+	}
+	if a.Log != nil {
+		a.Log.Info("Agent: streaming translated subchapter successfully (%d chars)", len(result))
+	}
+	return result, nil
 }
 
 func (a *Agent) WriteSubchapterStream(ctx context.Context, prompt string, onChunk func(string) error) (string, error) {

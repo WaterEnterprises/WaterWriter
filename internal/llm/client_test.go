@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -151,5 +152,130 @@ func TestSplitSystem(t *testing.T) {
 	}
 	if len(rest) != 1 || rest[0].Role != "user" {
 		t.Fatalf("rest = %+v", rest)
+	}
+}
+
+// TestACPComplete tests the ACP subprocess protocol end-to-end.
+// It requires the `opencode` binary to be installed and authenticated.
+// Run with: go test -run TestACPComplete -v ./internal/llm/
+func TestACPComplete(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping ACP integration test in short mode")
+	}
+
+	client := &Client{
+		Provider:    "opencode-acp",
+		Style:       StyleACP,
+		Model:       "opencode-acp",
+		RequiresKey: false,
+	}
+
+	// Check if the client is ready (binary exists in PATH).
+	ready, msg := client.Ready()
+	if !ready {
+		t.Skipf("ACP not ready: %s. Run 'opencode auth login' first.", msg)
+	}
+
+	// Test generating a book title.
+	ctx := t.Context()
+	t.Log("Testing ACP Complete with a book title prompt...")
+	result, err := client.Complete(ctx, []Message{
+		{Role: "system", Content: "You are a book title generator. Be creative and concise."},
+		{Role: "user", Content: "Generate a book title and subtitle about artificial intelligence and human consciousness. Format: Title: ... Subtitle: ..."},
+	}, 0.7)
+	if err != nil {
+		t.Fatalf("ACP Complete failed: %v", err)
+	}
+	if len(result) == 0 {
+		t.Fatal("ACP returned empty response")
+	}
+	t.Logf("ACP response (%d chars):\n%s", len(result), result)
+
+	// Verify the response looks like book content.
+	if !strings.Contains(result, ":") && !strings.Contains(result, "Title") {
+		t.Logf("WARNING: response may not be a proper book title (no colon or 'Title' found)")
+	}
+
+	t.Log("--- ACP Complete test PASSED ---")
+}
+
+// TestACPStream tests streaming via the ACP subprocess protocol.
+// It requires the `opencode` binary to be installed and authenticated.
+// Run with: go test -run TestACPStream -v ./internal/llm/
+func TestACPStream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping ACP integration test in short mode")
+	}
+
+	client := &Client{
+		Provider:    "opencode-acp",
+		Style:       StyleACP,
+		Model:       "opencode-acp",
+		RequiresKey: false,
+	}
+
+	ready, msg := client.Ready()
+	if !ready {
+		t.Skipf("ACP not ready: %s. Run 'opencode auth login' first.", msg)
+	}
+
+	ctx := t.Context()
+	var chunks []string
+	t.Log("Testing ACP streaming...")
+
+	result, err := client.CompleteStream(ctx, []Message{
+		{Role: "system", Content: "You are a helpful writing assistant. Be concise."},
+		{Role: "user", Content: "Write a single sentence about the future of AI."},
+	}, 0.7, func(chunk string) error {
+		chunks = append(chunks, chunk)
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("ACP Stream failed: %v", err)
+	}
+	if len(result) == 0 {
+		t.Fatal("ACP streaming returned empty result")
+	}
+	t.Logf("ACP streaming result (%d chars):\n%s", len(result), result)
+	t.Logf("Received %d streaming chunks", len(chunks))
+
+	t.Log("--- ACP Stream test PASSED ---")
+}
+
+// TestACPListModels tests the ACP model listing.
+func TestACPListModels(t *testing.T) {
+	client := &Client{
+		Provider:    "opencode-acp",
+		Style:       StyleACP,
+		Model:       "opencode-acp",
+		RequiresKey: false,
+	}
+
+	models, err := client.ListModels(t.Context())
+	if err != nil {
+		t.Fatalf("ACP ListModels failed: %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatal("ACP ListModels returned empty list")
+	}
+	t.Logf("ACP models: %v", models)
+}
+
+// TestACPReady tests the ACP Ready check.
+func TestACPReady(t *testing.T) {
+	client := &Client{
+		Provider:    "opencode-acp",
+		Style:       StyleACP,
+		Model:       "opencode-acp",
+		RequiresKey: false,
+	}
+
+	ready, msg := client.Ready()
+	t.Logf("ACP Ready: %v, msg: %s", ready, msg)
+
+	if !ready {
+		t.Logf("ACP not ready. This is expected if opencode is not in PATH or not authenticated.")
+		t.Logf("To fix: run 'opencode auth login' and ensure opencode is in PATH")
 	}
 }

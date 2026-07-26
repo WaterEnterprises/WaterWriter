@@ -160,6 +160,8 @@ var exportCmd = &cobra.Command{
 							continue
 						}
 						content = normalizeSpacing(content)
+						// Strip markdown syntax before adding to DOCX.
+						content = stripMarkdown(content)
 						doc.AddHeadingParagraph(s.Title, 3)
 						for _, p := range strings.Split(content, "\n\n") {
 							p = strings.TrimSpace(p)
@@ -180,6 +182,37 @@ var exportCmd = &cobra.Command{
 			fmt.Printf("Book exported to %s\n", docxPath)
 		}
 	},
+}
+
+// stripMarkdown removes markdown formatting syntax from text,
+// leaving only the visible content. This is used for DOCX export
+// where markdown syntax should not appear in the rendered document.
+func stripMarkdown(s string) string {
+	// Remove horizontal rules (standalone lines of ---, ***, ___)
+	s = regexp.MustCompile(`(?m)^[\s]*(\*\*\*|___|---)[\s]*$`).ReplaceAllString(s, "")
+
+	// Remove images: ![alt](url) → alt (do this before links since they share []( ) syntax)
+	s = regexp.MustCompile(`!\[([^\]]*)\]\([^)]+\)`).ReplaceAllString(s, "$1")
+
+	// Remove links: [text](url) → text
+	s = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`).ReplaceAllString(s, "$1")
+
+	// Remove bold: **text** → text
+	s = regexp.MustCompile(`\*\*(.+?)\*\*`).ReplaceAllString(s, "$1")
+
+	// Remove italic: *text* → text (only when word-boundary delimited)
+	s = regexp.MustCompile(`(^|[\s,\.;:!?\("'\-])\*([^*\s][^*]*[^*\s])\*($|[\s,\.;:!?\)"'\-])`).ReplaceAllString(s, "$1$2$3")
+
+	// Remove inline code: `text` → text
+	s = regexp.MustCompile("`([^`]+)`").ReplaceAllString(s, "$1")
+
+	// Remove strikethrough: ~~text~~ → text
+	s = regexp.MustCompile(`~~(.+?)~~`).ReplaceAllString(s, "$1")
+
+	// Remove blockquote markers: > text → text
+	s = regexp.MustCompile(`(?m)^>\s?`).ReplaceAllString(s, "")
+
+	return strings.TrimSpace(s)
 }
 
 // normalizeSpacing post-processes LLM content to fix common spacing issues.

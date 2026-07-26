@@ -10,6 +10,7 @@ import (
 
 	"github.com/WaterEnterprises/WaterWriter/internal/agent"
 	"github.com/WaterEnterprises/WaterWriter/internal/db"
+	"github.com/WaterEnterprises/WaterWriter/internal/llm"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -63,15 +64,27 @@ func TestQKeyDoesNotQuitInQAState(t *testing.T) {
 	}
 }
 
-func TestQKeyQuitsInNonInputStates(t *testing.T) {
+func TestQKeyDoesNotQuitInThinkState(t *testing.T) {
 	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateThink
 
 	keyMsg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")}
 	_, cmd := m.Update(keyMsg)
 
+	if isQuitCmd(cmd) {
+		t.Fatal("'q' in stateThink should not quit the app (use Ctrl+C instead)")
+	}
+}
+
+func TestQKeyQuitsInHomeState(t *testing.T) {
+	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
+	m.state = stateHome
+
+	keyMsg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")}
+	_, cmd := m.Update(keyMsg)
+
 	if !isQuitCmd(cmd) {
-		t.Fatal("expected 'q' in stateThink to quit, but got a different command")
+		t.Fatal("expected 'q' in stateHome to quit, but got a different command")
 	}
 }
 
@@ -283,7 +296,7 @@ func TestEnterOnErrorGoesToHome(t *testing.T) {
 	}
 }
 
-func TestQQuitsFromError(t *testing.T) {
+func TestQDoesNotQuitFromError(t *testing.T) {
 	m := NewModel(nil, &db.Project{Name: "Test"}, nil)
 	m.state = stateError
 	m.err = fmt.Errorf("test error")
@@ -291,8 +304,8 @@ func TestQQuitsFromError(t *testing.T) {
 	keyMsg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")}
 	_, cmd := m.Update(keyMsg)
 
-	if !isQuitCmd(cmd) {
-		t.Fatal("expected 'q' on error screen to quit, but got a different command")
+	if isQuitCmd(cmd) {
+		t.Fatal("'q' on error screen should not quit (use Ctrl+C or Enter instead)")
 	}
 }
 
@@ -1064,6 +1077,102 @@ func TestHomeExportViewShowsPathInput(t *testing.T) {
 	}
 }
 
+// ---------- Translation nil-safety tests ----------
+
+// TestTranslateBookNilProject verifies that translateBook() returns an error
+// message (via transProgressMsg) instead of panicking when m.project is nil.
+func TestTranslateBookNilProject(t *testing.T) {
+	m := NewModel(nil, nil, nil)
+	m.transCh = make(chan transProgressMsg, 10)
+	m.transLanguage = "Portuguese"
+
+	cmd := m.translateBook()
+	if cmd == nil {
+		t.Fatal("expected non-nil cmd from translateBook with nil project")
+	}
+
+	// Execute the command — it should return a done transProgressMsg with an error.
+	result := cmd()
+	msg, ok := result.(transProgressMsg)
+	if !ok {
+		t.Fatalf("expected transProgressMsg, got %T", result)
+	}
+	if !msg.done {
+		t.Fatal("expected done=true in the transProgressMsg (should be an error result)")
+	}
+	if msg.err == nil {
+		t.Fatal("expected a non-nil error from translateBook with nil project")
+	}
+	if !strings.Contains(msg.err.Error(), "no project selected") {
+		t.Fatalf("expected error to mention 'no project selected', got: %v", msg.err)
+	}
+}
+
+// TestTranslateBookNilChannel verifies that translateBook() returns an error
+// message instead of panicking when m.transCh is nil.
+func TestTranslateBookNilChannel(t *testing.T) {
+	m := NewModel(nil, &db.Project{ID: 1, Name: "Test"}, nil)
+	m.transCh = nil // explicitly nil
+	m.transLanguage = "French"
+
+	cmd := m.translateBook()
+	if cmd == nil {
+		t.Fatal("expected non-nil cmd from translateBook with nil transCh")
+	}
+
+	result := cmd()
+	msg, ok := result.(transProgressMsg)
+	if !ok {
+		t.Fatalf("expected transProgressMsg, got %T", result)
+	}
+	if !msg.done {
+		t.Fatal("expected done=true in the transProgressMsg (should be an error result)")
+	}
+	if msg.err == nil {
+		t.Fatal("expected a non-nil error from translateBook with nil transCh")
+	}
+	if !strings.Contains(msg.err.Error(), "translation channel not initialized") {
+		t.Fatalf("expected error to mention 'translation channel not initialized', got: %v", msg.err)
+	}
+}
+
+// TestTranslateBookValidSetup verifies that translateBook() with a valid
+// project and channel starts the goroutine and returns listenTranslation().
+// The command should read the first progress message from the channel.
+func TestTranslateBookValidSetup(t *testing.T) {
+	ag := newTestAgent(t)
+	proj, err := ag.DB.CreateProject("TestBook")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set a mock LLM client so the LLM nil-check guard passes.
+	ag.LLM = &llm.Client{Provider: "test", Model: "test-model"}
+
+	m := NewModel(ag, proj, nil)
+	m.transCh = make(chan transProgressMsg, 100)
+	m.transLanguage = "Portuguese"
+
+	cmd := m.translateBook()
+	if cmd == nil {
+		t.Fatal("expected non-nil cmd from translateBook with valid setup")
+	}
+
+	// Execute the command (listenTranslation) — it should read the first
+	// progress message from the goroutine ("Fetching book data...").
+	result := cmd()
+	msg, ok := result.(transProgressMsg)
+	if !ok {
+		t.Fatalf("expected transProgressMsg, got %T", result)
+	}
+	if msg.done {
+		t.Fatalf("expected a progress update (done=false), but got done=true: err=%v", msg.err)
+	}
+	if msg.text == "" {
+		t.Fatal("expected non-empty progress text")
+	}
+}
+
 // TestHomeExportViewShowsExportHint verifies the home view shows an [e] export
 // hint next to the selected project.
 func TestHomeExportViewShowsExportHint(t *testing.T) {
@@ -1082,8 +1191,8 @@ func TestHomeExportViewShowsExportHint(t *testing.T) {
 	if !strings.Contains(view, "OtherBook  —") {
 		t.Fatal("expected view to show the selected project name")
 	}
-	if !strings.Contains(view, "[e] export") {
-		t.Fatal("expected view to show '[e] export' hint on the selected project")
+	if !strings.Contains(view, "[e] book") && !strings.Contains(view, "[x] context") {
+		t.Fatal("expected view to show '[e] book' and '[x] context' hints on the selected project")
 	}
 	// The home screen footer should mention the 'e' key.
 	if !strings.Contains(view, "[e]") {

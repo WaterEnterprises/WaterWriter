@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,7 @@ const (
 	StyleOpenAI    Style = "openai"
 	StyleAnthropic Style = "anthropic"
 	StyleGemini    Style = "gemini"
+	StyleACP       Style = "acp"
 )
 
 // ProviderPreset describes a known LLM provider and how to talk to it.
@@ -225,6 +227,13 @@ var Providers = map[string]ProviderPreset{
 		Style:        StyleOpenAI,
 		RequiresKey:  false,
 	},
+	"opencode-acp": {
+		Name:         "OpenCode ACP (subprocess)",
+		BaseURL:      "",
+		DefaultModel: "opencode-acp",
+		Style:        StyleACP,
+		RequiresKey:  false,
+	},
 	"custom": {
 		Name:         "Custom OpenAI-compatible",
 		BaseURL:      "",
@@ -255,6 +264,7 @@ type Client struct {
 	ThinkingEffort string // "low" | "medium" | "high" (empty = default)
 	HTTP           *http.Client
 	Log            *log.Logger // optional logger for API call logging
+	ACPProcessPath string   // path to the `opencode` binary (default: "opencode")
 }
 
 // Config is the resolved LLM configuration. Any field left empty falls back to
@@ -466,6 +476,32 @@ func (c *Client) backoffSleep(ctx context.Context, attempt int, baseDelay, maxDe
 
 // Ready reports whether the client can make a request (i.e. required key set).
 func (c *Client) Ready() (bool, string) {
+	if c.Style == StyleACP {
+		// For ACP, check that the `opencode` binary is available in PATH.
+		bin := c.ACPProcessPath
+		if bin == "" {
+			bin = "opencode"
+		}
+		if _, err := exec.LookPath(bin); err != nil {
+			msg := fmt.Sprintf("OpenCode ACP binary %q not found in PATH. Install opencode from https://github.com/WaterEnterprises/opencode", bin)
+			if c.Log != nil {
+				c.Log.Warn("LLM not ready: %s", msg)
+			}
+			return false, msg
+		}
+		if c.Model == "" {
+			msg := "no model configured for ACP."
+			if c.Log != nil {
+				c.Log.Warn("LLM not ready: %s", msg)
+			}
+			return false, msg
+		}
+		if c.Log != nil {
+			c.Log.Info("LLM ready: provider=%s model=%s", c.Provider, c.Model)
+		}
+		return true, ""
+	}
+
 	if c.RequiresKey && c.APIKey == "" {
 		msg := fmt.Sprintf("API key required for provider %q. Set WATERWRITER_LLM_API_KEY (or use provider \"ollama\" / a custom local endpoint).", c.Provider)
 		if c.Log != nil {
@@ -506,6 +542,8 @@ func (c *Client) Complete(ctx context.Context, messages []Message, temperature f
 		return c.anthropicComplete(ctx, messages, temperature, false)
 	case StyleGemini:
 		return c.geminiComplete(ctx, messages, temperature, false)
+	case StyleACP:
+		return c.acpComplete(ctx, messages, temperature)
 	default:
 		return c.openAIComplete(ctx, messages, temperature, false)
 	}
@@ -521,6 +559,8 @@ func (c *Client) CompleteStream(ctx context.Context, messages []Message, tempera
 		return c.anthropicComplete(ctx, messages, temperature, true, onChunk)
 	case StyleGemini:
 		return c.geminiComplete(ctx, messages, temperature, true, onChunk)
+	case StyleACP:
+		return c.acpCompleteStream(ctx, messages, temperature, onChunk)
 	default:
 		return c.openAIStream(ctx, messages, temperature, onChunk)
 	}
@@ -1075,6 +1115,8 @@ func (c *Client) ListModels(ctx context.Context) ([]string, error) {
 		return c.listAnthropicModels(ctx)
 	case StyleGemini:
 		return c.listGeminiModels(ctx)
+	case StyleACP:
+		return c.acpListModels(ctx)
 	default:
 		return c.listOpenAIModels(ctx)
 	}

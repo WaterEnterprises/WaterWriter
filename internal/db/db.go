@@ -113,6 +113,18 @@ func (d *DB) migrate() error {
 			created_at TEXT NOT NULL,
 			FOREIGN KEY(project_id) REFERENCES projects(id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS translations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			project_id INTEGER NOT NULL,
+			language TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'in_progress',
+			file_path TEXT NOT NULL DEFAULT '',
+			total_subs INTEGER NOT NULL DEFAULT 0,
+			done_subs INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			FOREIGN KEY(project_id) REFERENCES projects(id)
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := d.Exec(s); err != nil {

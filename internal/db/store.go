@@ -399,7 +399,58 @@ func (d *DB) GetPhase(projectID int) string {
 	return "done"
 }
 
+// --- Translations ---
+
+// DeleteTranslation removes a translation record by ID.
+func (d *DB) DeleteTranslation(id int) error {
+	_, err := d.Exec(`DELETE FROM translations WHERE id = ?`, id)
+	return err
+}
+
+// DeletePendingTranslations removes all incomplete translations for a project
+// and language combination. Used when starting a new translation to prevent
+// duplicate entries accumulating from failed or interrupted runs.
+func (d *DB) DeletePendingTranslations(projectID int, language string) error {
+	_, err := d.Exec(`DELETE FROM translations WHERE project_id = ? AND language = ? AND status != 'complete'`, projectID, language)
+	return err
+}
+
+func (d *DB) SaveTranslation(projectID int, language string) (*Translation, error) {
+	ts := now()
+	res, err := d.Exec(`INSERT INTO translations (project_id, language, status, file_path, total_subs, done_subs, created_at, updated_at) VALUES (?, ?, 'in_progress', '', 0, 0, ?, ?)`,
+		projectID, language, ts, ts)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &Translation{ID: int(id), ProjectID: projectID, Language: language, Status: "in_progress", CreatedAt: ts, UpdatedAt: ts}, nil
+}
+
+func (d *DB) GetTranslations(projectID int) ([]*Translation, error) {
+	rows, err := d.Query(`SELECT id, project_id, language, status, file_path, total_subs, done_subs, created_at, updated_at FROM translations WHERE project_id = ? ORDER BY created_at`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Translation
+	for rows.Next() {
+		t := &Translation{}
+		if err := rows.Scan(&t.ID, &t.ProjectID, &t.Language, &t.Status, &t.FilePath, &t.TotalSubs, &t.DoneSubs, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (d *DB) UpdateTranslation(id int, status, filePath string, totalSubs, doneSubs int) error {
+	_, err := d.Exec(`UPDATE translations SET status = ?, file_path = ?, total_subs = ?, done_subs = ?, updated_at = ? WHERE id = ?`,
+		status, filePath, totalSubs, doneSubs, now(), id)
+	return err
+}
+
 func (d *DB) DeleteProjectData(projectID int) error {
+	d.Exec(`DELETE FROM translations WHERE project_id = ?`, projectID)
 	d.Exec(`DELETE FROM todos WHERE project_id = ?`, projectID)
 	d.Exec(`DELETE FROM subchapters WHERE project_id = ?`, projectID)
 	d.Exec(`DELETE FROM chapters WHERE project_id = ?`, projectID)

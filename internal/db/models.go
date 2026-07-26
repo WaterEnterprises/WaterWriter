@@ -64,3 +64,15 @@ type Todo struct {
 	Done      bool
 	CreatedAt string
 }
+
+type Translation struct {
+	ID        int
+	ProjectID int
+	Language  string
+	Status    string // "in_progress" or "complete"
+	FilePath  string
+	TotalSubs int
+	DoneSubs  int
+	CreatedAt string
+	UpdatedAt string
+}

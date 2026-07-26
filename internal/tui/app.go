@@ -34,6 +34,7 @@ const (
 	stateQAReview
 	stateWrite
 	stateDone
+	stateProjectMenu
 	stateError
 )
 
@@ -67,6 +68,15 @@ type configSavedMsg struct {
 	client  *llm.Client
 	ready   bool
 	warning string
+}
+
+type transProgressMsg struct {
+	done  bool
+	err   error
+	path  string
+	text  string
+	chunk string // streaming content chunk for live subchapter translation
+	reset bool   // true when starting a new subchapter (clear buffer)
 }
 
 type exportDoneMsg struct {
@@ -168,6 +178,29 @@ type Model struct {
 	homeExportError  error
 	homeExportStep int    // 0=off, 1=path entry, 2=subs choice, 3=format choice
 
+	// Context export — Q&A pairs and compiled brief
+	ctxExporting     bool
+	ctxExportPath    string
+	ctxExportResult  string
+	ctxExportError   error
+	ctxExportPending bool // set true before firing exportContext(), cleared after routing result
+
+	// Translation
+	translating       bool
+	transLanguage     string
+	transStep         int    // 0=off, 1=language entry, 2=path entry, 3=running
+	transResult       string
+	transError        error
+	transExportPath   string
+	transCh           chan transProgressMsg
+	transBuffer       string               // accumulated streaming content for current subchapter
+	transView         viewport.Model       // viewport for live translation content
+	translationID     int    // DB record for current translation, to update on completion
+
+	// Project menu (submenu for done projects with translations)
+	translations       []*db.Translation
+	projectMenuCursor  int
+
 	// Log
 	logLines []string
 
@@ -217,8 +250,9 @@ func NewModel(ag *agent.Agent, proj *db.Project, logger *log.Logger) *Model {
 		state:     stateInit,
 		input:     ti,
 		spinner:   s,
-		writeView: viewport.New(80, 20),
-		phase:     "qa",
+		writeView:  viewport.New(80, 20),
+		transView:  viewport.New(80, 10),
+		phase:      "qa",
 	}
 	return m
 }
@@ -256,7 +290,17 @@ func (m Model) loadProjects() tea.Cmd {
 	}
 }
 
-func (m *Model) handleHomeKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) handleHomeKey(msg tea.KeyMsg) (retCmd tea.Cmd) {
+	// Local panic recovery: if any handler in this function panics, catch it
+	// and return it as an errMsg instead of crashing the app.
+	defer func() {
+		if r := recover(); r != nil {
+			retCmd = func() tea.Msg {
+				return errMsg{fmt.Errorf("home key handler error: %v", r)}
+			}
+		}
+	}()
+
 	// While typing a new book name, let the text input handle all keys except
 	// the few we intercept (create / cancel / quit).
 	if m.creating {
@@ -288,7 +332,94 @@ func (m *Model) handleHomeKey(msg tea.KeyMsg) tea.Cmd {
 		return cmd
 	}
 
-	// While showing an export result or error overlay, handle key events.
+	// While showing a translation result or error overlay.
+	if m.transResult != "" || m.transError != nil {
+		switch msg.String() {
+		case "ctrl+c", "q":
+			m.cancel()
+			return tea.Quit
+		case "enter":
+			m.transResult = ""
+			m.transError = nil
+			return nil
+		case "t":
+			// Clear error/result and fall through to the navigation switch below
+			// so the 't' handler can start a new translation.
+			m.transResult = ""
+			m.transError = nil
+		default:
+			return nil
+		}
+	}
+
+	// While in translation language entry mode.
+	if m.translating {
+		switch msg.String() {
+		case "ctrl+c":
+			m.cancel()
+			return tea.Quit
+		case "enter":
+			return m.startTranslationSafe()
+		case "esc":
+			m.translating = false
+			m.transStep = 0
+			m.transResult = ""
+			m.transError = nil
+			m.input.SetValue("")
+			return nil
+		}
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		return cmd
+	}
+
+	// While showing a context export result or error overlay, handle key events.
+	if m.ctxExportResult != "" || m.ctxExportError != nil {
+		switch msg.String() {
+		case "ctrl+c", "q":
+			m.cancel()
+			return tea.Quit
+		case "enter":
+			m.ctxExportResult = ""
+			m.ctxExportError = nil
+			return nil
+		case "x":
+			m.ctxExportResult = ""
+			m.ctxExportError = nil
+		default:
+			return nil
+		}
+	}
+
+	// While in context export path entry mode.
+	if m.ctxExporting {
+		switch msg.String() {
+		case "ctrl+c":
+			m.cancel()
+			return tea.Quit
+		case "enter":
+			path := strings.TrimSpace(m.input.Value())
+			if path == "" {
+				path = "."
+			}
+			m.ctxExportPath = path
+			m.ctxExporting = false
+			m.ctxExportPending = true
+			m.input.SetValue("")
+			return m.exportContext()
+		case "esc":
+			m.ctxExporting = false
+			m.ctxExportResult = ""
+			m.ctxExportError = nil
+			m.input.SetValue("")
+			return nil
+		}
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		return cmd
+	}
+
+	// While showing a book export result or error overlay, handle key events.
 	if m.homeExportResult != "" || m.homeExportError != nil {
 		switch msg.String() {
 		case "ctrl+c", "q":
@@ -397,6 +528,18 @@ func (m *Model) handleHomeKey(msg tea.KeyMsg) tea.Cmd {
 		m.input.SetValue("")
 		m.input.Placeholder = "Book name..."
 		return nil
+		case "t":
+			// Only offer translation for finished (done) books.
+			if m.cursor > 0 && m.cursor-1 < len(m.projects) && m.projects[m.cursor-1].Status == "done" {
+				m.project = m.projects[m.cursor-1]
+				m.translating = true
+				m.transStep = 1
+				m.transResult = ""
+				m.transError = nil
+				m.input.SetValue("")
+				m.input.Placeholder = "Language (e.g., Portuguese, French, Japanese)..."
+				return nil
+			}
 		case "o":
 			m.startConfig("config")
 			return nil
@@ -408,6 +551,18 @@ func (m *Model) handleHomeKey(msg tea.KeyMsg) tea.Cmd {
 				m.homeExportStep = 1
 				m.homeExportResult = ""
 				m.homeExportError = nil
+				m.input.SetValue(".")
+				m.input.Placeholder = "Export directory (default: .)"
+				return nil
+			}
+		case "x":
+			// Export Q&A and context for the currently selected project.
+			if m.cursor > 0 && m.cursor-1 < len(m.projects) {
+				m.project = m.projects[m.cursor-1]
+				m.ctxExporting = true
+				m.ctxExportPath = ""
+				m.ctxExportResult = ""
+				m.ctxExportError = nil
 				m.input.SetValue(".")
 				m.input.Placeholder = "Export directory (default: .)"
 				return nil
@@ -429,7 +584,18 @@ func (m *Model) handleHomeKey(msg tea.KeyMsg) tea.Cmd {
 				m.startConfig("open")
 				return nil
 			}
-			m.project = m.projects[m.cursor-1]
+			proj := m.projects[m.cursor-1]
+			m.project = proj
+			// For done projects, check if there are translations and show the project menu.
+			if proj.Status == "done" {
+				translations, err := m.agent.DB.GetTranslations(proj.ID)
+				if err == nil && len(translations) > 0 {
+					m.translations = translations
+					m.projectMenuCursor = 0
+					m.state = stateProjectMenu
+					return nil
+				}
+			}
 			m.state = stateInit
 			return m.resolvePhase()
 		}
@@ -681,7 +847,23 @@ func (m *Model) handleConfigKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m Model) Update(msg tea.Msg) (retModel tea.Model, retCmd tea.Cmd) {
+	// Global panic recovery: any panic from any handler (stateHome, stateConfig,
+	// stateProjectMenu, etc.) is caught here instead of crashing the app.
+	// This is necessary because Bubble Tea does NOT recover panics in Update.
+	// Uses NAMED return parameters so the defer can set them on recovery —
+	// with unnamed returns, Go would return zero values (nil interface),
+	// causing a nil-interface panic on the next Bubble Tea Update call.
+	defer func() {
+		if r := recover(); r != nil {
+			m.state = stateError
+			m.err = fmt.Errorf("internal error in Update: %v", r)
+			m.log(fmt.Sprintf("PANIC in Update: %v", r))
+			retModel = m
+			retCmd = nil
+		}
+	}()
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -690,6 +872,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// minus 4 for left/right padding).
 		m.writeView.Width = min(msg.Width-4, contentMaxWidth-4)
 		m.writeView.Height = msg.Height - 8
+		// Translation viewport — smaller than writing view, mostly for the
+		// current subchapter being streamed in.
+		m.transView.Width = min(msg.Width-4, contentMaxWidth-4)
+		m.transView.Height = msg.Height / 3
 
 	case tea.MouseMsg:
 		if m.state == stateHome {
@@ -719,14 +905,119 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == stateConfig {
 			return m, m.handleConfigKey(msg)
 		}
+		// Project menu key handling (submenu for done projects with translations)
+		if m.state == stateProjectMenu {
+			switch msg.String() {
+			case "ctrl+c":
+				m.cancel()
+				return m, tea.Quit
+			case "esc":
+				m.state = stateHome
+				m.translations = nil
+				return m, m.loadProjects()
+			case "q":
+				m.state = stateHome
+				m.translations = nil
+				return m, m.loadProjects()
+			case "up", "k":
+				if m.projectMenuCursor > 0 {
+					m.projectMenuCursor--
+				}
+				return m, nil
+			case "down", "j":
+				maxIdx := len(m.translations) // 0 = original, 1+ = translations
+				if m.projectMenuCursor < maxIdx {
+					m.projectMenuCursor++
+				}
+				return m, nil
+			case "enter":
+				if m.projectMenuCursor == 0 {
+					// Open the original book (done state).
+					m.state = stateInit
+					m.translations = nil
+					return m, m.resolvePhase()
+				}
+				// Enter on a translation: copy the translation file to the current directory.
+				idx := m.projectMenuCursor - 1
+				if idx >= 0 && idx < len(m.translations) {
+					t := m.translations[idx]
+					if t.FilePath != "" {
+						// Copy translation file to the current directory.
+						dest := filepath.Join(".", t.Language+"_translation.md")
+						data, readErr := os.ReadFile(t.FilePath)
+						if readErr != nil {
+							m.transError = fmt.Errorf("read translation file: %w", readErr)
+						} else if writeErr := os.WriteFile(dest, data, 0o644); writeErr != nil {
+							m.transError = fmt.Errorf("write translation file: %w", writeErr)
+						} else {
+							m.transResult = fmt.Sprintf("Exported %s translation → %s", t.Language, dest)
+						}
+					} else {
+						m.transError = fmt.Errorf("%s translation is incomplete (use 't' to retranslate)", t.Language)
+					}
+					m.state = stateHome
+					m.translations = nil
+				}
+				return m, nil
+			case "t":
+				// 't' starts a translation.
+				// On original (cursor 0): enter language on home screen.
+				// On a translation: retranslate that language.
+				if m.projectMenuCursor == 0 {
+					// Enter language entry mode for a new translation.
+					m.translating = true
+					m.transStep = 1
+					m.transResult = ""
+					m.transError = nil
+					m.input.SetValue("")
+					m.input.Placeholder = "Language (e.g., Portuguese, French, Japanese)..."
+					m.state = stateHome
+					m.translations = nil
+					return m, nil
+				}
+				idx := m.projectMenuCursor - 1
+				if idx < 0 || idx >= len(m.translations) {
+					return m, nil
+				}
+				lang := m.translations[idx].Language
+				if lang == "" || len(lang) < 2 {
+					return m, nil
+				}
+				m.transLanguage = lang
+				m.translating = false
+				m.transStep = 0
+				// Delete all pending translations for this language before creating
+				// a new record — prevents duplicate entries from accumulating.
+				if err := m.agent.DB.DeletePendingTranslations(m.project.ID, lang); err != nil {
+					m.log(fmt.Sprintf("WARN cleaning up old translations: %v", err))
+				}
+				transRec, err := m.agent.DB.SaveTranslation(m.project.ID, lang)
+				if err != nil {
+					m.transError = fmt.Errorf("save translation: %w", err)
+					m.state = stateHome
+					m.translations = nil
+					return m, nil
+				}
+				m.translationID = transRec.ID
+				m.state = stateThink
+				m.thinkingText = fmt.Sprintf("Translating to %s...", lang)
+				m.logLines = nil
+				m.transCh = make(chan transProgressMsg, 100)
+				m.translations = nil
+				return m, m.translateBook()
+			}
+			return m, nil
+		}
+
 		switch msg.String() {
 		case "ctrl+c":
 			m.cancel()
 			return m, tea.Quit
 		case "q":
-			// Don't quit during QA text input — 'q' is a common letter in pasted text.
-			// Users can still use Ctrl+C to quit from any state.
-			if m.state != stateQA {
+			// Don't quit during QA, Think, or Write states — 'q' is a common letter
+			// in pasted text, and users may press it thinking it cancels an operation.
+			// Ctrl+C still works to quit from any state.
+			if m.state != stateQA && m.state != stateThink && m.state != stateWrite && m.state != stateError {
 				m.cancel()
 				return m, tea.Quit
 			}
@@ -895,7 +1186,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.exportStep = 0
 				return m, m.exportBook()
 			}
-			return m, tea.Quit
+			// Enter after export result (or any Enter in done state not during export
+			// setup) returns to the home screen instead of quitting.
+			m.state = stateHome
+			return m, m.loadProjects()
 		}
 		}
 		// QA review key handling
@@ -1111,10 +1405,64 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.log(fmt.Sprintf("ERROR: %v", msg.err))
 		return m, nil
 
+	// Translation progress update (streamed from the translate goroutine)
+	case transProgressMsg:
+		if msg.done {
+			// Translation complete — close channel and update DB record.
+			if m.transCh != nil {
+				close(m.transCh)
+				m.transCh = nil
+			}
+			if m.translationID > 0 {
+				status := "complete"
+				path := msg.path
+				if msg.err != nil {
+					status = "in_progress"
+					path = ""
+				}
+				m.agent.DB.UpdateTranslation(m.translationID, status, path, 0, 0)
+				m.translationID = 0
+			}
+			m.state = stateHome
+			if msg.err != nil {
+				m.transError = msg.err
+				m.log(fmt.Sprintf("Translation error: %v", msg.err))
+			} else {
+				m.transResult = msg.path
+			}
+			return m, nil
+		}
+		// Reset the live buffer when starting a new subchapter.
+		if msg.reset {
+			m.transBuffer = ""
+			m.transView.SetContent("")
+			if msg.text != "" {
+				m.log(msg.text)
+			}
+			return m, m.listenTranslation()
+		}
+		// Streaming chunk — append to live buffer and update viewport.
+		if msg.chunk != "" {
+			m.transBuffer += msg.chunk
+			m.transView.SetContent(m.transBuffer)
+			m.transView.GotoBottom()
+			return m, m.listenTranslation()
+		}
+		// Progress update — add to log lines and keep listening.
+		m.log(msg.text)
+		return m, m.listenTranslation()
+
 	// Export done
 	case exportDoneMsg:
-		// Route result to the right set of fields based on current state.
-		if m.state == stateHome {
+		// Route based on the ctxExportPending flag (set before exportContext fires).
+		if m.ctxExportPending {
+			m.ctxExportPending = false
+			if msg.err != nil {
+				m.ctxExportError = msg.err
+			} else {
+				m.ctxExportResult = msg.path
+			}
+		} else if m.state == stateHome {
 			if msg.err != nil {
 				m.homeExportError = msg.err
 			} else {
@@ -1139,6 +1487,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Handle input for states that use the text input widget
 	if m.state == stateQA || (m.state == stateHome && m.creating) ||
 		(m.state == stateHome && m.homeExporting) ||
+		(m.state == stateHome && m.ctxExporting) ||
+		(m.state == stateHome && m.translating) ||
 		(m.state == stateConfig && (m.configStep == 1 || m.configStep == 2)) ||
 		(m.state == stateDone && m.exportingPath) {
 		// Track the time of the last key event for paste-Enter detection.
@@ -1309,6 +1659,18 @@ func (m Model) generateAllSubchapters() tea.Cmd {
 			if err != nil {
 				return errMsg{fmt.Errorf("generate subchapters for %q: %w", ch.Title, err)}
 			}
+			// Guard against empty subchapter results from the LLM.
+			// Retry once; if still empty, create a default fallback.
+			if len(subs) == 0 {
+				subs, err = m.agent.GenerateSubchapters(m.ctx, brief, ch.Title)
+				if err != nil {
+					return errMsg{fmt.Errorf("generate subchapters for %q (retry): %w", ch.Title, err)}
+				}
+			}
+			if len(subs) == 0 {
+				m.log(fmt.Sprintf("⚠ LLM returned no subchapters for %q — adding default", ch.Title))
+				subs = []string{"Overview"}
+			}
 			for j, subTitle := range subs {
 				s, err := m.agent.DB.SaveSubchapter(ch.ID, book.ID, m.project.ID, j+1, subTitle)
 				if err != nil {
@@ -1418,6 +1780,294 @@ func (m Model) listenStream() tea.Cmd {
 		}
 		return msg
 	}
+}
+
+func (m Model) listenTranslation() tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-m.transCh
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
+// translateBook translates the entire book to a target language and writes
+// the translated version to a markdown file. Streams progress via transCh.
+// Must be called after m.transCh is created. Returns listenTranslation() as
+// the first channel read, mirroring beginWrite()/listenStream().
+func (m *Model) translateBook() tea.Cmd {
+	// Safety check — guard against nil dependencies to prevent a
+	// panic from crashing the app (translateBook is NOT wrapped in safeCmd).
+	if m == nil || m.project == nil {
+		return func() tea.Msg {
+			return transProgressMsg{done: true, err: fmt.Errorf("no project selected")}
+		}
+	}
+	if m.transCh == nil {
+		return func() tea.Msg {
+			return transProgressMsg{done: true, err: fmt.Errorf("translation channel not initialized")}
+		}
+	}
+	if m.agent == nil {
+		return func() tea.Msg {
+			return transProgressMsg{done: true, err: fmt.Errorf("agent not initialized")}
+		}
+	}
+	if m.agent.DB == nil {
+		return func() tea.Msg {
+			return transProgressMsg{done: true, err: fmt.Errorf("database not initialized")}
+		}
+	}
+	if m.agent.LLM == nil {
+		return func() tea.Msg {
+			return transProgressMsg{done: true, err: fmt.Errorf("LLM client not configured — use 'o' to configure")}
+		}
+	}
+
+	language := m.transLanguage
+	projectID := m.project.ID
+	projName := m.project.Name
+	tch := m.transCh
+
+	m.log(fmt.Sprintf("Starting translation of %q to %s (project %d)", projName, language, projectID))
+
+	send := func(text string) {
+		tch <- transProgressMsg{text: text}
+	}
+	sendDone := func(err error, path string) {
+		tch <- transProgressMsg{done: true, err: err, path: path}
+		// NOTE: channel is NOT closed here. The transProgressMsg handler
+		// in Update() is responsible for closing and nil'ing the channel.
+	}
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				tch <- transProgressMsg{done: true, err: fmt.Errorf("internal error: %v", r)}
+			}
+		}()
+
+		send("Fetching book data...")
+		book, err := m.agent.DB.GetBook(projectID)
+		if err != nil {
+			sendDone(fmt.Errorf("get book: %w", err), "")
+			return
+		}
+		chapters, err := m.agent.DB.GetChapters(projectID)
+		if err != nil {
+			sendDone(fmt.Errorf("get chapters: %w", err), "")
+			return
+		}
+
+		// Step 1: Translate title and chapter titles
+		send("Translating title and table of contents...")
+		translated, err := m.agent.TranslateTitleTOC(m.ctx, language, book.Title, book.Subtitle, chapters)
+		if err != nil {
+			sendDone(fmt.Errorf("translate title: %w", err), "")
+			return
+		}
+		if len(translated) < 2 {
+			sendDone(fmt.Errorf("translation returned incomplete data"), "")
+			return
+		}
+		transTitle := translated[0]
+		transSubtitle := translated[1]
+		transChapters := translated[2:]
+		send(fmt.Sprintf("✓ Title: %s", transTitle))
+
+		// Build the translated markdown
+		var fullBook strings.Builder
+		fullBook.WriteString(fmt.Sprintf("# %s\n\n", transTitle))
+		if transSubtitle != "" {
+			fullBook.WriteString(fmt.Sprintf("## %s\n\n", transSubtitle))
+		}
+		fullBook.WriteString(fmt.Sprintf("> _Translated from \"%s\" to %s_\n\n", book.Title, language))
+		fullBook.WriteString("---\n\n")
+
+		// Step 2: Translate each subchapter
+		totalSubs := 0
+		doneSubs := 0
+		for _, ch := range chapters {
+			subs, _ := m.agent.DB.GetSubchapters(ch.ID)
+			for _, s := range subs {
+				if s.Content != "" {
+					totalSubs++
+				}
+			}
+		}
+
+		for i, ch := range chapters {
+			chTitle := transChapters[i]
+			fullBook.WriteString(fmt.Sprintf("## Chapter %d: %s\n\n", i+1, chTitle))
+
+			subs, err := m.agent.DB.GetSubchapters(ch.ID)
+			if err != nil {
+				continue
+			}
+
+			for _, s := range subs {
+				if s.Content == "" {
+					continue
+				}
+				doneSubs++
+
+				// Signal start of new subchapter — reset live buffer
+				tch <- transProgressMsg{reset: true}
+				send(fmt.Sprintf("[%d/%d] Translating: %s / %s", doneSubs, totalSubs, chTitle, s.Title))
+
+				var localBuf strings.Builder
+				translatedContent, err := m.agent.TranslateSubchapterContentStream(m.ctx,
+					language,
+					book.Title, book.Subtitle,
+					ch.Title, s.Title, s.Content,
+					func(chunk string) error {
+						localBuf.WriteString(chunk)
+						tch <- transProgressMsg{chunk: chunk}
+						return nil
+					})
+				if err != nil {
+					send(fmt.Sprintf("⚠ Error translating %q, using original: %v", s.Title, err))
+					translatedContent = s.Content
+				} else {
+					send(fmt.Sprintf("✓ [%d/%d] %s translated", doneSubs, totalSubs, s.Title))
+				}
+
+				fullBook.WriteString(fmt.Sprintf("### %s\n\n", s.Title))
+				fullBook.WriteString(translatedContent)
+				fullBook.WriteString("\n\n")
+			}
+		}
+
+		// Write to a directory
+		send("Writing translated file...")
+		dir := filepath.Join(".", sanitize(projName)+"_"+sanitize(language))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			sendDone(fmt.Errorf("create directory: %w", err), "")
+			return
+		}
+		bookPath := filepath.Join(dir, "book.md")
+		if err := os.WriteFile(bookPath, []byte(fullBook.String()), 0o644); err != nil {
+			sendDone(fmt.Errorf("write file: %w", err), "")
+			return
+		}
+
+		sendDone(nil, bookPath)
+	}()
+
+	return m.listenTranslation()
+}
+
+// startTranslationSafe processes the Enter key during translation language entry on
+// the home screen. It is extracted from handleHomeKey so it can have its own
+// defer/recover — handleHomeKey itself has no panic recovery, and any panic there
+// would propagate through Update() and crash the entire app.
+func (m *Model) startTranslationSafe() (cmd tea.Cmd) {
+	// Catch any panic and return it as an errMsg instead of crashing.
+	defer func() {
+		if r := recover(); r != nil {
+			cmd = func() tea.Msg {
+				return errMsg{fmt.Errorf("translation setup error: %v", r)}
+			}
+		}
+	}()
+
+	lang := strings.TrimSpace(m.input.Value())
+	if lang == "" || len(lang) < 2 {
+		return nil
+	}
+
+	// Guard against nil project or DB before accessing them.
+	if m.project == nil {
+		return func() tea.Msg {
+			return errMsg{fmt.Errorf("no project selected for translation")}
+		}
+	}
+	if m.agent == nil || m.agent.DB == nil {
+		return func() tea.Msg {
+			return errMsg{fmt.Errorf("database not available for translation")}
+		}
+	}
+
+	m.transLanguage = lang
+	m.translating = false
+	m.transStep = 0
+	m.input.SetValue("")
+
+	// Delete any pending (incomplete) translations for this language
+	// before creating a new record, to prevent duplicate entries.
+	if err := m.agent.DB.DeletePendingTranslations(m.project.ID, lang); err != nil {
+		m.log(fmt.Sprintf("WARN cleaning up old translations: %v", err))
+	}
+
+	// Save a translation record in the DB.
+	transRec, err := m.agent.DB.SaveTranslation(m.project.ID, lang)
+	if err != nil {
+		return func() tea.Msg { return errMsg{fmt.Errorf("save translation: %w", err)} }
+	}
+	m.translationID = transRec.ID
+
+	// Switch to think state with progress view.
+	m.state = stateThink
+	m.thinkingText = fmt.Sprintf("Translating to %s...", lang)
+	m.logLines = nil
+	m.transCh = make(chan transProgressMsg, 100)
+	return m.translateBook()
+}
+
+// exportContext writes the Q&A pairs and the compiled book brief to a directory.
+func (m *Model) exportContext() tea.Cmd {
+	return safeCmd(func() tea.Msg {
+		projectID := m.project.ID
+		projName := m.project.Name
+		dir := filepath.Join(m.ctxExportPath, sanitize(projName)+"_context")
+
+		// Fetch data first so we don't create an empty directory on error.
+		pairs, err := m.agent.DB.GetQAPairs(projectID)
+		if err != nil {
+			return exportDoneMsg{err: fmt.Errorf("get Q&A pairs: %w", err)}
+		}
+		briefContent, briefErr := m.agent.DB.GetBrief(projectID)
+
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return exportDoneMsg{err: fmt.Errorf("create directory: %w", err)}
+		}
+
+		// Write Q&A pairs to qa.md.
+		var qaContent strings.Builder
+		qaContent.WriteString(fmt.Sprintf("# Q&A — %s\n\n", projName))
+		if len(pairs) == 0 {
+			qaContent.WriteString("_No Q&A answers recorded yet._\n")
+		} else {
+			for _, p := range pairs {
+				fmt.Fprintf(&qaContent, "## Question %d\n\n", p.Position)
+				qaContent.WriteString(p.Question)
+				qaContent.WriteString("\n\n")
+				qaContent.WriteString("### Answer\n\n")
+				qaContent.WriteString(p.Answer)
+				qaContent.WriteString("\n\n---\n\n")
+			}
+		}
+		qaPath := filepath.Join(dir, "qa.md")
+		if err := os.WriteFile(qaPath, []byte(qaContent.String()), 0o644); err != nil {
+			return exportDoneMsg{err: fmt.Errorf("write qa.md: %w", err)}
+		}
+
+		// Write compiled brief to brief.md (if it exists).
+		briefContent, briefErr = m.agent.DB.GetBrief(projectID)
+		briefPath := filepath.Join(dir, "brief.md")
+		var briefMd string
+		if briefErr == nil && briefContent != "" {
+			briefMd = fmt.Sprintf("# Book Brief — %s\n\n%s\n", projName, briefContent)
+		} else {
+			briefMd = fmt.Sprintf("# Book Brief — %s\n\n_No compiled brief yet. Complete the Q&A phase to generate a brief._\n", projName)
+		}
+		if err := os.WriteFile(briefPath, []byte(briefMd), 0o644); err != nil {
+			return exportDoneMsg{err: fmt.Errorf("write brief.md: %w", err)}
+		}
+
+		return exportDoneMsg{path: dir}
+	})
 }
 
 // exportHomeBook builds the full book markdown for the current project and writes it.
@@ -1565,6 +2215,8 @@ func (m *Model) writeDocxFile(outDir, title, subtitle string, chapters []*db.Cha
 				}
 				// Fix LLM spacing issues (merged words) at export time.
 				content = normalizeSpacing(content)
+				// Strip markdown syntax before adding to DOCX.
+				content = stripMarkdown(content)
 				doc.AddHeadingParagraph(s.Title, 3)
 				for _, p := range strings.Split(content, "\n\n") {
 					p = strings.TrimSpace(p)
@@ -1596,6 +2248,37 @@ func (m *Model) exportBook() tea.Cmd {
 		}
 		return m.writeExportFile(m.exportPath, book.Title, book.Subtitle, chapters)
 	})
+}
+
+// stripMarkdown removes markdown formatting syntax from text,
+// leaving only the visible content. This is used for DOCX export
+// where markdown syntax should not appear in the rendered document.
+func stripMarkdown(s string) string {
+	// Remove horizontal rules (standalone lines of ---, ***, ___)
+	s = regexp.MustCompile(`(?m)^[\s]*(\*\*\*|___|---)[\s]*$`).ReplaceAllString(s, "")
+
+	// Remove images: ![alt](url) → alt (do this before links since they share []( ) syntax)
+	s = regexp.MustCompile(`!\[([^\]]*)\]\([^)]+\)`).ReplaceAllString(s, "$1")
+
+	// Remove links: [text](url) → text
+	s = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`).ReplaceAllString(s, "$1")
+
+	// Remove bold: **text** → text
+	s = regexp.MustCompile(`\*\*(.+?)\*\*`).ReplaceAllString(s, "$1")
+
+	// Remove italic: *text* → text (only when word-boundary delimited)
+	s = regexp.MustCompile(`(^|[\s,\.;:!?\("'\-])\*([^*\s][^*]*[^*\s])\*($|[\s,\.;:!?\)"'\-])`).ReplaceAllString(s, "$1$2$3")
+
+	// Remove inline code: `text` → text
+	s = regexp.MustCompile("`([^`]+)`").ReplaceAllString(s, "$1")
+
+	// Remove strikethrough: ~~text~~ → text
+	s = regexp.MustCompile(`~~(.+?)~~`).ReplaceAllString(s, "$1")
+
+	// Remove blockquote markers: > text → text
+	s = regexp.MustCompile(`(?m)^>\s?`).ReplaceAllString(s, "")
+
+	return strings.TrimSpace(s)
 }
 
 // cleanContent strips leading #-style markdown headings from text content.
@@ -1678,7 +2361,16 @@ func normalizeSpacing(s string) string {
 	return s
 }
 
-func (m Model) View() string {
+func (m Model) View() (view string) {
+	// Panic recovery so a rendering error doesn't crash the app.
+	// View() has a value receiver so we can't change the model's state
+	// permanently — just return a safe fallback string instead.
+	defer func() {
+		if r := recover(); r != nil {
+			view = fmt.Sprintf("Rendering error (see log): %v", r)
+		}
+	}()
+
 	switch m.state {
 	case stateInit:
 		return m.loadingView("Initializing...")
@@ -1696,10 +2388,17 @@ func (m Model) View() string {
 		return m.qaReviewView()
 
 	case stateThink:
+		// Show the live translation stream view when actively translating.
+		if m.transCh != nil {
+			return m.translationView()
+		}
 		return m.thinkingView()
 
 	case stateWrite:
 		return m.writingView()
+
+	case stateProjectMenu:
+		return m.projectMenuView()
 
 	case stateDone:
 		return m.doneView()
@@ -1908,7 +2607,75 @@ func (m Model) homeView() string {
 		b.WriteString(dimStyle.Render("    Press [c] or [Enter] to configure via the setup wizard"))
 	}
 
-	// Show export result (success or error) in place of the project list
+	// Show context export result (success or error) in place of the project list
+	if m.ctxExportResult != "" {
+		b.WriteString("\n\n")
+		b.WriteString(successStyle.Render(" ✓ Context exported successfully!"))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  %s\n\n", m.ctxExportResult))
+		b.WriteString(dimStyle.Render("  [Enter] to go back   •   [x] export again   •   [q] quit"))
+		return m.centeredView(b.String())
+	}
+
+	if m.ctxExportError != nil {
+		b.WriteString("\n\n")
+		b.WriteString(errorStyle.Render(" ✗ Context export failed"))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  %v\n\n", m.ctxExportError))
+		b.WriteString(dimStyle.Render("  [Enter] to go back   •   [x] retry   •   [q] quit"))
+		return m.centeredView(b.String())
+	}
+
+	// Show context export path entry.
+	if m.ctxExporting {
+		b.WriteString("\n\n")
+		projName := ""
+		if m.cursor > 0 && m.cursor-1 < len(m.projects) {
+			projName = m.projects[m.cursor-1].Name
+		}
+		b.WriteString(fmt.Sprintf(" Export Q&A + Brief for %s\n\n", infoStyle.Render(projName)))
+		b.WriteString(" Directory:\n\n")
+		b.WriteString(fmt.Sprintf("  %s\n", m.input.View()))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("  [Enter] confirm   •   [Esc] cancel   •   [Ctrl+C] quit"))
+		return m.centeredView(b.String())
+	}
+
+	// Show translation result (success or error) in place of the project list
+	if m.transResult != "" {
+		b.WriteString("\n\n")
+		b.WriteString(successStyle.Render(" ✓ Translated successfully!"))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  %s\n\n", m.transResult))
+		b.WriteString(dimStyle.Render("  [Enter] to go back   •   [q] quit"))
+		return m.centeredView(b.String())
+	}
+
+	if m.transError != nil {
+		b.WriteString("\n\n")
+		b.WriteString(errorStyle.Render(" ✗ Translation failed"))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  %v\n\n", m.transError))
+		b.WriteString(dimStyle.Render("  [t] to retry   •   [Enter] to go back   •   [q] quit"))
+		return m.centeredView(b.String())
+	}
+
+	// Show translation language entry.
+	if m.translating {
+		b.WriteString("\n\n")
+		projName := ""
+		if m.cursor > 0 && m.cursor-1 < len(m.projects) {
+			projName = m.projects[m.cursor-1].Name
+		}
+		b.WriteString(fmt.Sprintf(" Translate %s\n\n", infoStyle.Render(projName)))
+		b.WriteString(" Language:\n\n")
+		b.WriteString(fmt.Sprintf("  %s\n", m.input.View()))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("  [Enter] confirm   •   [Esc] cancel   •   [Ctrl+C] quit"))
+		return m.centeredView(b.String())
+	}
+
+	// Show book export result (success or error) in place of the project list
 	if m.homeExportResult != "" {
 		b.WriteString("\n\n")
 		b.WriteString(successStyle.Render(" ✓ Exported successfully!"))
@@ -1979,7 +2746,10 @@ func (m Model) homeView() string {
 		phase := m.agent.DB.GetPhase(p.ID)
 		exportHint := ""
 		if m.cursor == i+1 {
-			exportHint = dimStyle.Render("  [e] export")
+			exportHint = dimStyle.Render("  [e] book  [x] context")
+			if p.Status == "done" {
+				exportHint = dimStyle.Render("  [e] book  [x] context  [t] translate")
+			}
 		}
 		b.WriteString(fmt.Sprintf("%s%s  —  %s%s\n", prefix, p.Name, phase, exportHint))
 	}
@@ -1997,8 +2767,45 @@ func (m Model) homeView() string {
 		b.WriteString(fmt.Sprintf("  New book name: %s\n", m.input.View()))
 		b.WriteString(dimStyle.Render("  [Enter] create   •   [Esc] cancel"))
 	} else {
-		b.WriteString(dimStyle.Render("  [↑/↓] move   •   [Enter] select   •   [e] export   •   [c] new   •   [o] config   •   [q] quit"))
+		b.WriteString(dimStyle.Render("  [↑/↓] move   •   [Enter] select   •   [e] book   •   [x] context   •   [t] translate   •   [c] new   •   [o] config   •   [q] quit"))
 	}
+	return m.centeredView(b.String())
+}
+
+func (m Model) projectMenuView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("📖 " + m.project.Name + " — Project Menu"))
+	b.WriteString("\n\n")
+
+	// Original book item
+	prefix := "  "
+	if m.projectMenuCursor == 0 {
+		prefix = "> "
+	}
+	b.WriteString(fmt.Sprintf("%s📖  1. Original Book (English)\n", prefix))
+
+	// Translation items
+	for i, t := range m.translations {
+		idx := i + 1
+		p := "  "
+		if m.projectMenuCursor == idx {
+			p = "> "
+		}
+		statusIcon := "⚠"
+		statusText := "In Progress"
+		if t.Status == "complete" {
+			statusIcon = "✓"
+			statusText = "Complete"
+		}
+		progress := ""
+		if t.TotalSubs > 0 && t.Status != "complete" {
+			progress = fmt.Sprintf(" [%d/%d]", t.DoneSubs, t.TotalSubs)
+		}
+		b.WriteString(fmt.Sprintf("%s🌐  %d. %s — %s %s%s\n", p, idx, t.Language, statusIcon, statusText, progress))
+	}
+
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render("  [↑/↓] navigate  •  [Enter] open/export  •  [t] translate  •  [Esc] back  •  [q] quit"))
 	return m.centeredView(b.String())
 }
 
@@ -2087,6 +2894,72 @@ func (m Model) thinkingView() string {
 			b.WriteString(fmt.Sprintf("  %s\n", dimStyle.Render(l)))
 		}
 	}
+	b.WriteString(fmt.Sprintf("\n  %s", dimStyle.Render("[Ctrl+C] to quit")))
+	return m.centeredView(b.String())
+}
+
+// translationView shows a live stream of the current subchapter being translated,
+// including a progress bar and the streaming text in a viewport.
+func (m Model) translationView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("📖 Water Writer — Translating"))
+	b.WriteString("\n")
+
+	// Progress bar from the last log line with "[N/M]" pattern
+	var pct float64
+	var pos string
+	if len(m.logLines) > 0 {
+		for i := len(m.logLines) - 1; i >= 0; i-- {
+			l := m.logLines[i]
+			if strings.Contains(l, "[") && strings.Contains(l, "]") {
+				// Try to parse [N/M] from the log line
+				if idx := strings.Index(l, "["); idx >= 0 {
+					rest := l[idx:]
+					end := strings.Index(rest, "]")
+					if end > 0 {
+						inner := rest[1:end]
+						parts := strings.Split(inner, "/")
+						if len(parts) == 2 {
+							var nVal, dVal int
+							fmt.Sscanf(parts[0], "%d", &nVal)
+							fmt.Sscanf(parts[1], "%d", &dVal)
+							if nVal > 0 && dVal > 0 {
+								pct = float64(nVal) / float64(dVal) * 100
+								pos = l
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	bar := progressBar(int(pct), min(50, m.width-20))
+	b.WriteString(fmt.Sprintf("  %s  %s\n\n", bar, progressStyle.Render(fmt.Sprintf("%.0f%%", pct))))
+
+	// Current position (last log line that contains "[N/M] Translating:")
+	if pos != "" {
+		b.WriteString(fmt.Sprintf("  %s\n\n", dimStyle.Render(pos)))
+	}
+
+	// Streamed content viewport
+	b.WriteString(m.transView.View())
+
+	// Log lines below
+	if len(m.logLines) > 0 {
+		b.WriteString("\n")
+		// Show up to 3 log lines (excluding the pos line which is shown above)
+		shown := 0
+		for i := len(m.logLines) - 1; i >= 0 && shown < 3; i-- {
+			l := m.logLines[i]
+			if l == pos || l == "" {
+				continue
+			}
+			b.WriteString(fmt.Sprintf("  %s\n", dimStyle.Render(l)))
+			shown++
+		}
+	}
+
 	b.WriteString(fmt.Sprintf("\n  %s", dimStyle.Render("[Ctrl+C] to quit")))
 	return m.centeredView(b.String())
 }
